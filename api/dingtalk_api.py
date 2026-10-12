@@ -64,6 +64,26 @@ class DingTalkApiClient:
         return data
 
     # ------------------------------------------------------------------
+    # 查询假期余额
+    # ------------------------------------------------------------------
+    def get_vacation_quota(self, user_ids: str, leave_code: str) -> dict:
+        url = f"{self.OAPI_BASE}/topapi/attendance/vacation/quota/list"
+        params = {"access_token": self.get_access_token()}
+
+        body = {
+            "userids": user_ids,
+            "leave_code": leave_code,
+            "op_userid": self.admin_user_id,
+            "offset": 0,
+            "size": 20,
+        }
+
+        resp = requests.post(url, params=params, json=body, timeout=15)
+        data = resp.json()
+        if data.get("errcode") != 0:
+            raise RuntimeError(f"查询假期余额失败: {data}")
+        return data
+    # ------------------------------------------------------------------
     # 批量更新假期余额
     # ------------------------------------------------------------------
     def update_vacation_quota(self, user_id: str, leave_code: str,
@@ -90,7 +110,6 @@ class DingTalkApiClient:
                 }
             ],
         }
-        print(body)
 
         resp = requests.post(url, params=params, json=body, timeout=15)
         data = resp.json()

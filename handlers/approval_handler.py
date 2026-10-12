@@ -56,12 +56,12 @@ class ApprovalEventHandler(dingtalk_stream.EventHandler):
 
         # 2. 过滤：仅处理"审批完成 + 同意"
         if status != self.STATUS_FINISH or result != self.RESULT_AGREE:
-            self.logger.info("filtered 1 :%s",instance_id)
+            self.logger.info("filtered 1 :%s", instance_id)
             return AckMessage.STATUS_OK, "OK"
 
         # 3. 过滤：仅处理奖励假期审批模板
         if process_code != self.cfg.reward_leave_process_code:
-            self.logger.info("filtered 2 :%s",instance_id)
+            self.logger.info("filtered 2 :%s", instance_id)
             return AckMessage.STATUS_OK, "OK"
 
         # 4. 业务处理放入线程池，避免阻塞 Stream 事件循环
@@ -104,7 +104,27 @@ class ApprovalEventHandler(dingtalk_stream.EventHandler):
                 user_id, days, self.cfg.reward_leave_code,
             )
 
+            query_res = self.api.get_vacation_quota(user_id, self.cfg.reward_leave_code)
+            # 解析剩余假期
+            remaining_days = None
+            if query_res.get("errcode") == 0:
+                quotas = query_res.get("result", {}).get("leave_quotas", [])
+                if quotas:
+                    q = quotas[0]
+                    total = q.get("quota_num_per_day", 0)  # 总余额，百分之一天
+                    used = q.get("used_num_per_day", 0)  # 已使用，百分之一天
+                    remaining_days = (total - used) / 100.0  # 转为天
+
+            if remaining_days is not None:
+                self.logger.info(
+                    "用户当前剩余假期 | userId=%s | 剩余=%s天",
+                    user_id, remaining_days,
+                )
+            else:
+                self.logger.warning("未能获取剩余假期 | userId=%s", user_id)
+
             # 3. 调用 API 累加假期余额
+            days = days + remaining_days
             result = self.api.update_vacation_quota(
                 user_id=user_id,
                 leave_code=self.cfg.reward_leave_code,
