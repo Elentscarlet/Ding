@@ -13,7 +13,7 @@ import logging
 import dingtalk_stream
 from dingtalk_stream import AckMessage
 
-from api import DingTalkApiClient
+from api import DingTalkApiClient, DingTalkApiError
 
 
 class ApprovalEventHandler(dingtalk_stream.EventHandler):
@@ -107,6 +107,7 @@ class ApprovalEventHandler(dingtalk_stream.EventHandler):
             query_res = self.api.get_vacation_quota(user_id, self.cfg.reward_leave_code)
             # 解析剩余假期
             remaining_days = None
+            used = 0
             if query_res.get("errcode") == 0:
                 quotas = query_res.get("result", {}).get("leave_quotas", [])
                 if quotas:
@@ -114,17 +115,19 @@ class ApprovalEventHandler(dingtalk_stream.EventHandler):
                     total = q.get("quota_num_per_day", 0)  # 总余额，百分之一天
                     used = q.get("used_num_per_day", 0)  # 已使用，百分之一天
                     remaining_days = (total - used) / 100.0  # 转为天
+                    used = used / 100.0
 
             if remaining_days is not None:
                 self.logger.info(
-                    "用户当前剩余假期 | userId=%s | 剩余=%s天",
-                    user_id, remaining_days,
+                    "用户当前剩余假期 | userId=%s | 剩余=%s天 | 已使用=%s天",
+                    user_id, remaining_days,used
                 )
             else:
                 self.logger.warning("未能获取剩余假期 | userId=%s", user_id)
+                remaining_days = 0
 
             # 3. 调用 API 累加假期余额
-            days = days + remaining_days
+            days = days + used + remaining_days
             result = self.api.update_vacation_quota(
                 user_id=user_id,
                 leave_code=self.cfg.reward_leave_code,
@@ -132,6 +135,15 @@ class ApprovalEventHandler(dingtalk_stream.EventHandler):
             )
             self.logger.info("假期余额更新成功: %s", result)
 
+        except DingTalkApiError as e:
+            # 重试已经在 API 层做过；走到这里说明已经放弃，
+            # 这张单子不会被钉钉重推，必须人工补发。
+            self.logger.error(
+                "处理奖励假期审批失败，需人工补发 | instanceId=%s | code=%s | "
+                "status=%s | 可重试=%s | 错误: %s",
+                process_instance_id, e.code or e.errcode, e.status_code,
+                e.retryable, e, exc_info=True,
+            )
         except Exception as e:
             self.logger.error(
                 "处理奖励假期审批失败 | instanceId=%s | 错误: %s",

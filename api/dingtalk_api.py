@@ -4,14 +4,54 @@
 钉钉 OpenAPI 客户端封装：
   - access_token 自动缓存刷新
   - 获取审批实例详情
-  - 批量更新假期余额
+  - 查询 / 批量更新假期余额
+  - 错误分类 + 退避重试（区分"可安全重试"与"不可重试"）
 """
 
 import logging
+import random
+import re
 import time
-from typing import Optional
+from datetime import datetime
+from typing import Any, Optional
 
 import requests
+
+
+class DingTalkApiError(RuntimeError):
+    """钉钉接口调用失败。
+
+    retryable 表示"重试这个请求是安全的"：
+      - 幂等接口（查询类）：限流、5xx、连接超时、SSL 中断都可以重试；
+      - 非幂等接口（写假期余额）：只有服务端明确拒绝了请求（限流/配额拒绝）
+        才能重试；连接超时或 5xx 时请求可能在服务端已经生效，
+        盲目重试会造成重复发放。
+    """
+
+    def __init__(self, message: str, *, code=None, errcode=None,
+                 status_code=None, retryable: bool = False,
+                 retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.code = code
+        self.errcode = errcode
+        self.status_code = status_code
+        self.retryable = retryable
+        self.retry_after = retry_after
+
+
+# 服务端"明确拒绝、请求未被受理"的信号 —— 写接口也能安全重试
+_REJECT_HINTS = ("qpslimit", "qps", "throttl", "ratelimit", "toomanyrequests")
+_REJECT_ERRCODES = {88, 90018}  # 请求被限流 / 请求过于频繁
+# 临时性故障 —— 只有幂等接口可以重试
+_TRANSIENT_HINTS = ("systembusy", "serviceunavailable", "internalerror",
+                    "requesttimeout", "serverbusy", "gatewaytimeout")
+_TRANSIENT_ERRCODES = {-1, 50002}  # 系统繁忙
+
+# 钉钉限流报错里会给出解除时间，例如："限制将在 2026-10-13 10:30:01 结束"
+_LIMIT_END_RE = re.compile(r"限制将在\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+
+_MIN_WAIT = 0.2
+_MAX_WAIT = 8.0
 
 
 class DingTalkApiClient:
@@ -19,11 +59,25 @@ class DingTalkApiClient:
     API_BASE = "https://api.dingtalk.com"
 
     def __init__(self, client_id: str, client_secret: str,
-                 admin_user_id: str, logger: logging.Logger):
+                 admin_user_id: str, logger: logging.Logger,
+                 max_retries: int = 3,
+                 retry_base_delay: float = 0.5,
+                 retry_deadline: float = 10.0,
+                 timeout: float = 10.0):
+        """
+        :param max_retries: 单个请求的最大重试次数（总尝试次数 = max_retries + 1）
+        :param retry_base_delay: 退避基数（秒），第 n 次重试等待 base * 2^(n-1)
+        :param retry_deadline: 单个请求的重试总时长上限（秒），超过即放弃
+        :param timeout: 单次 HTTP 请求超时（秒）
+        """
         self.client_id = client_id
         self.client_secret = client_secret
         self.admin_user_id = admin_user_id
         self.logger = logger
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        self.retry_deadline = retry_deadline
+        self.timeout = timeout
         self._access_token: Optional[str] = None
         self._token_expire_at: float = 0.0
 
@@ -35,14 +89,15 @@ class DingTalkApiClient:
         if self._access_token and now < self._token_expire_at - 300:
             return self._access_token
 
-        resp = requests.get(
+        data = self._call(
+            "GET",
             f"{self.OAPI_BASE}/gettoken",
+            idempotent=True,
+            describe="获取 access_token",
             params={"appkey": self.client_id, "appsecret": self.client_secret},
-            timeout=10,
         )
-        data = resp.json()
-        if data.get("errcode") != 0:
-            raise RuntimeError(f"获取 access_token 失败: {data}")
+        if not data.get("access_token"):
+            raise DingTalkApiError(f"获取 access_token 失败: {data}")
 
         self._access_token = data["access_token"]
         self._token_expire_at = now + data.get("expires_in", 7200)
@@ -57,11 +112,13 @@ class DingTalkApiClient:
         headers = {"x-acs-dingtalk-access-token": self.get_access_token()}
         params = {"processInstanceId": process_instance_id}
 
-        resp = requests.get(url, headers=headers, params=params, timeout=15)
-        data = resp.json()
-        if resp.status_code != 200:
-            raise RuntimeError(f"获取审批实例详情失败: {data}")
-        return data
+        return self._call(
+            "GET", url,
+            idempotent=True,
+            describe=f"获取审批实例详情({process_instance_id})",
+            headers=headers,
+            params=params,
+        )
 
     # ------------------------------------------------------------------
     # 查询假期余额
@@ -78,11 +135,14 @@ class DingTalkApiClient:
             "size": 20,
         }
 
-        resp = requests.post(url, params=params, json=body, timeout=15)
-        data = resp.json()
-        if data.get("errcode") != 0:
-            raise RuntimeError(f"查询假期余额失败: {data}")
-        return data
+        return self._call(
+            "POST", url,
+            idempotent=True,
+            describe=f"查询假期余额({user_ids})",
+            params=params,
+            json=body,
+        )
+
     # ------------------------------------------------------------------
     # 批量更新假期余额
     # ------------------------------------------------------------------
@@ -111,8 +171,162 @@ class DingTalkApiClient:
             ],
         }
 
-        resp = requests.post(url, params=params, json=body, timeout=15)
-        data = resp.json()
-        if data.get("errcode") != 0:
-            raise RuntimeError(f"更新假期余额失败: {data}")
+        # 写接口非幂等：只有服务端明确拒绝（限流等）才允许重试
+        data = self._call(
+            "POST", url,
+            idempotent=False,
+            describe=f"更新假期余额({user_id})",
+            params=params,
+            json=body,
+        )
+
+        # 该接口单条操作失败时顶层 errcode 仍为 0，
+        # 真正的失败原因在 result[] 的 reason 字段里，必须单独判定。
+        rejected = [
+            item for item in (data.get("result") or [])
+            if isinstance(item, dict) and item.get("reason")
+        ]
+        if rejected:
+            raise DingTalkApiError(
+                f"更新假期余额被拒绝: {rejected}",
+                errcode=data.get("errcode"),
+                status_code=200,
+                retryable=False,
+            )
         return data
+
+    # ------------------------------------------------------------------
+    # 重试与错误分类（内部实现）
+    # ------------------------------------------------------------------
+    def _call(self, method: str, url: str, *, idempotent: bool,
+              describe: str, timeout: Optional[float] = None, **kwargs) -> dict:
+        """发起请求，按错误类型决定是否退避重试；成功时返回解析后的 JSON。
+
+        失败时抛出 DingTalkApiError（携带 retryable 标记），
+        不再区分 RuntimeError / 返回码，调用方只需捕获一种异常。
+        """
+        attempts = self.max_retries + 1
+        started = time.monotonic()
+
+        for attempt in range(1, attempts + 1):
+            status_code: Optional[int] = None
+            parsed = True
+            try:
+                resp = requests.request(
+                    method, url, timeout=timeout or self.timeout, **kwargs
+                )
+                status_code = resp.status_code
+                try:
+                    data = resp.json()
+                except ValueError:
+                    parsed = False
+                    data = {"message": (resp.text or "")[:500]}
+            except requests.RequestException as e:
+                data = {"message": f"{type(e).__name__}: {e}"}
+
+            failed = (
+                not parsed
+                or status_code != 200
+                or (isinstance(data, dict) and data.get("errcode") not in (None, 0))
+                or (isinstance(data, dict) and data.get("success") is False)
+            )
+            if not failed:
+                return data
+
+            retryable, retry_after = self._classify(
+                status_code, data, idempotent=idempotent
+            )
+            if retryable and attempt < attempts:
+                wait = retry_after if retry_after is not None else self._backoff(attempt)
+                elapsed = time.monotonic() - started
+                if elapsed + wait > self.retry_deadline:
+                    self.logger.error(
+                        "%s：重试已耗时 %.1fs，放弃重试 | %s", describe, elapsed, data,
+                    )
+                    break
+                self.logger.warning(
+                    "%s 失败（第 %d/%d 次，可重试）: %s，%.2f 秒后重试",
+                    describe, attempt, attempts, data, wait,
+                )
+                time.sleep(wait)
+                continue
+
+            if attempt > 1:
+                self.logger.error(
+                    "%s：重试 %d 次后仍失败 | %s", describe, attempt - 1, data,
+                )
+            raise self._build_error(describe, status_code, data, retryable, retry_after)
+
+        # 仅在上面的 deadline 分支跳出时到达
+        raise self._build_error(describe, status_code, data, True, None)
+
+    @classmethod
+    def _classify(cls, status_code: Optional[int], payload: Any, *,
+                  idempotent: bool):
+        """返回 (retryable, retry_after)。"""
+        text = cls._payload_text(payload)
+        errcode = payload.get("errcode") if isinstance(payload, dict) else None
+
+        # 服务端明确拒绝，请求未被受理 —— 任何接口都可安全重试
+        if (
+            status_code == 429
+            or any(hint in text for hint in _REJECT_HINTS)
+            or errcode in _REJECT_ERRCODES
+        ):
+            return True, cls._retry_after_from(payload)
+
+        # 结果不确定的故障：只有幂等接口可以重试
+        if not idempotent:
+            return False, None
+
+        transient = (
+            status_code is None            # 连接层异常（超时/SSL/连接失败）
+            or status_code >= 500
+            or any(hint in text for hint in _TRANSIENT_HINTS)
+            or errcode in _TRANSIENT_ERRCODES
+        )
+        return transient, None
+
+    @staticmethod
+    def _payload_text(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return str(payload).lower()
+        return " ".join(
+            str(payload.get(key, ""))
+            for key in ("code", "message", "errmsg", "subCode", "subMessage")
+        ).lower()
+
+    @staticmethod
+    def _retry_after_from(payload: Any) -> Optional[float]:
+        """从限流报错里解析解除时间，得到需要等待的秒数。"""
+        if not isinstance(payload, dict):
+            return None
+        match = _LIMIT_END_RE.search(str(payload.get("message", "")))
+        if not match:
+            return None
+        try:
+            end = datetime.strptime(
+                match.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S"
+            )
+        except ValueError:
+            return None
+        wait = (end - datetime.now()).total_seconds() + 0.2
+        return max(_MIN_WAIT, min(wait, _MAX_WAIT))
+
+    def _backoff(self, attempt: int) -> float:
+        delay = min(self.retry_base_delay * (2 ** (attempt - 1)), _MAX_WAIT)
+        return delay * random.uniform(0.8, 1.2)
+
+    @staticmethod
+    def _build_error(describe: str, status_code: Optional[int], payload: Any,
+                     retryable: bool, retry_after: Optional[float]) -> DingTalkApiError:
+        code = payload.get("code") if isinstance(payload, dict) else None
+        errcode = payload.get("errcode") if isinstance(payload, dict) else None
+        return DingTalkApiError(
+            f"{describe}失败: {payload}",
+            code=code,
+            errcode=errcode,
+            status_code=status_code,
+            retryable=retryable,
+            retry_after=retry_after,
+        )

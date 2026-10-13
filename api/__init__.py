@@ -1,3 +1,3 @@
-from .dingtalk_api import DingTalkApiClient
+from .dingtalk_api import DingTalkApiClient, DingTalkApiError
 
-__all__ = ["DingTalkApiClient"]
+__all__ = ["DingTalkApiClient", "DingTalkApiError"]
