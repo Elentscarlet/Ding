@@ -12,10 +12,13 @@ import time
 import dingtalk_stream
 
 from api import DingTalkApiClient
+from checkin_poller import CheckinPoller
 from config_loader import load_config
+from db import CheckinStore, UserStore
 from handlers import ApprovalEventHandler
 from logger_setup import setup_logger
 from stream_runner import StreamRunner
+from web_server import WebServer
 
 
 def main():
@@ -48,11 +51,40 @@ def main():
         ApprovalEventHandler(cfg.approval, api, logger)
     )
 
-    # 5. 启动 Stream 运行器
+    # 5. 准备依赖 MongoDB 的组件（构造失败会直接退出，不会留下半启动状态）
+    checkin_store = None
+    user_store = None
+    checkin_poller = None
+    web_server = None
+
+    if cfg.checkin.enabled or cfg.web.enabled:
+        checkin_store = CheckinStore(cfg.checkin.mongo, logger)
+        user_store = UserStore(cfg.checkin.mongo, logger)
+
+    if cfg.checkin.enabled:
+        checkin_poller = CheckinPoller(
+            cfg.checkin, api, checkin_store, logger, user_store
+        )
+    else:
+        logger.info("外勤打卡轮询未启用（checkin.enabled = false）")
+
+    if cfg.web.enabled:
+        web_server = WebServer(
+            cfg.web, api, checkin_store, user_store,
+            cfg.checkin.utc_offset_hours, logger,
+        )
+    else:
+        logger.info("打卡查询页未启用（web.enabled = false）")
+
+    # 6. 启动 Stream 运行器、轮询任务与查询页
     runner = StreamRunner(client, cfg, logger)
     runner.start()
+    if checkin_poller is not None:
+        checkin_poller.start()
+    if web_server is not None:
+        web_server.start()
 
-    # 6. 等待退出信号
+    # 7. 等待退出信号
     stop_event = threading.Event()
 
     def _shutdown(signum, _frame):
@@ -69,6 +101,10 @@ def main():
         pass
     finally:
         runner.stop()
+        if checkin_poller is not None:
+            checkin_poller.stop()
+        if web_server is not None:
+            web_server.stop()
         logger.info("程序已退出")
 
 

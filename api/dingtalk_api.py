@@ -54,6 +54,15 @@ _MIN_WAIT = 0.2
 _MAX_WAIT = 8.0
 
 
+def _as_bool(value) -> bool:
+    """钉钉部分接口把布尔值返回成字符串（"true"/"false"），需要归一化。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
 class DingTalkApiClient:
     OAPI_BASE = "https://oapi.dingtalk.com"
     API_BASE = "https://api.dingtalk.com"
@@ -194,6 +203,175 @@ class DingTalkApiClient:
                 retryable=False,
             )
         return data
+
+    # ------------------------------------------------------------------
+    # 通讯录：子部门 / 部门成员
+    # ------------------------------------------------------------------
+    def list_sub_departments(self, dept_id: int) -> list:
+        """获取指定部门的下一级子部门（单层，不含更深层级）。"""
+        url = f"{self.OAPI_BASE}/topapi/v2/department/listsub"
+        data = self._call(
+            "POST", url,
+            idempotent=True,
+            describe=f"获取子部门列表(dept_id={dept_id})",
+            params={"access_token": self.get_access_token()},
+            json={"dept_id": int(dept_id), "language": "zh_CN"},
+        )
+        return data.get("result") or []
+
+    def collect_department_users(self, dept_ids, include_sub_departments: bool = True,
+                                 max_depth: int = 5) -> list:
+        """汇总若干部门（可选含多级子部门）下的成员，返回 [{"user_id","name"}]，去重且保序。
+
+        子部门接口需要「通讯录部门信息读权限」；未开通时只告警一次并退化为
+        仅统计配置里列出的部门，不影响主流程。
+        """
+        ordered: list = []
+        seen: set = set()
+        visited_depts: set = set()
+        sub_warned = False
+
+        queue = [(int(d), 0) for d in dept_ids]
+        while queue:
+            dept_id, depth = queue.pop(0)
+            if dept_id in visited_depts:
+                continue
+            visited_depts.add(dept_id)
+
+            try:
+                for user in self.list_department_users(dept_id):
+                    user_id = user.get("userid")
+                    if user_id and user_id not in seen:
+                        seen.add(user_id)
+                        ordered.append({
+                            "user_id": user_id,
+                            "name": user.get("name") or "",
+                        })
+            except DingTalkApiError as e:
+                self.logger.error("获取部门 %s 的成员失败，跳过该部门: %s", dept_id, e)
+
+            if not include_sub_departments or depth >= max_depth:
+                continue
+            try:
+                for sub in self.list_sub_departments(dept_id):
+                    sub_id = sub.get("dept_id")
+                    if sub_id is not None:
+                        queue.append((int(sub_id), depth + 1))
+            except DingTalkApiError as e:
+                if not sub_warned:
+                    self.logger.warning(
+                        "获取子部门失败（通常是缺少「通讯录部门信息读权限」），"
+                        "本次仅统计配置中列出的部门: %s", e,
+                    )
+                    sub_warned = True
+
+        return ordered
+
+    def list_department_users(self, dept_id: int, page_size: int = 100,
+                              max_pages: int = 50) -> list:
+        """获取部门成员详情（含姓名），自动翻页。不含子部门。
+
+        注意：该接口的 has_more / next_cursor 可能返回字符串，需要归一化。
+        """
+        url = f"{self.OAPI_BASE}/topapi/v2/user/list"
+        users: list = []
+        cursor = 0
+
+        for _ in range(max_pages):
+            data = self._call(
+                "POST", url,
+                idempotent=True,
+                describe=f"获取部门成员详情(dept_id={dept_id}, cursor={cursor})",
+                params={"access_token": self.get_access_token()},
+                json={
+                    "dept_id": int(dept_id),
+                    "cursor": cursor,
+                    "size": page_size,
+                    "order_field": "custom",
+                    "contain_access_limit": False,
+                    "language": "zh_CN",
+                },
+            )
+            result = data.get("result") or {}
+            users.extend(result.get("list") or [])
+
+            if not _as_bool(result.get("has_more")):
+                return users
+
+            next_cursor = result.get("next_cursor")
+            try:
+                next_cursor = int(next_cursor)
+            except (TypeError, ValueError):
+                return users
+            if next_cursor == cursor:
+                return users
+            cursor = next_cursor
+
+        self.logger.warning(
+            "部门 %s 成员翻页达到上限 %d，可能未取全", dept_id, max_pages
+        )
+        return users
+
+    # ------------------------------------------------------------------
+    # 免登：用授权码换用户信息
+    # ------------------------------------------------------------------
+    def get_userinfo_by_code(self, code: str) -> dict:
+        """用免登授权码换取用户信息（userid / name / sys / sys_level）。
+
+        授权码 5 分钟内有效且**只能使用一次**，所以按非幂等处理：
+        网络超时后不重试（码可能已被消耗），只有服务端明确拒绝才重试。
+        """
+        url = f"{self.OAPI_BASE}/topapi/v2/user/getuserinfo"
+        data = self._call(
+            "POST", url,
+            idempotent=False,
+            describe="免登码换取用户信息",
+            params={"access_token": self.get_access_token()},
+            json={"code": code},
+        )
+        return data.get("result") or {}
+
+    # ------------------------------------------------------------------
+    # 考勤：打卡详情（含外勤坐标）
+    # ------------------------------------------------------------------
+    # 接口硬限制
+    MAX_RECORD_USER_IDS = 50      # userIds 单次最多 50 个
+    MAX_RECORD_RANGE_DAYS = 7     # checkDateFrom/checkDateTo 跨度最多 7 天
+
+    def list_attendance_records(self, user_ids, date_from: str, date_to: str,
+                                is_i18n: bool = False) -> list:
+        """获取打卡详情，返回 recordresult 列表。
+
+        与大部分 topapi 不同，该接口把记录放在**顶层** recordresult 字段里，
+        而不是 result 下面。
+
+        :param user_ids: userid 列表，单次最多 50 个
+        :param date_from: "yyyy-MM-dd HH:mm:ss"
+        :param date_to: "yyyy-MM-dd HH:mm:ss"，与 date_from 跨度最多 7 天
+        :param is_i18n: 是否海外企业
+        """
+        user_ids = [uid for uid in user_ids if uid]
+        if not user_ids:
+            return []
+        if len(user_ids) > self.MAX_RECORD_USER_IDS:
+            raise ValueError(
+                f"userIds 单次最多 {self.MAX_RECORD_USER_IDS} 个，当前传入 {len(user_ids)} 个"
+            )
+
+        url = f"{self.OAPI_BASE}/attendance/listRecord"
+        data = self._call(
+            "POST", url,
+            idempotent=True,
+            describe=f"获取打卡详情({len(user_ids)}人 {date_from}~{date_to})",
+            params={"access_token": self.get_access_token()},
+            json={
+                "userIds": user_ids,
+                "checkDateFrom": date_from,
+                "checkDateTo": date_to,
+                "isI18n": is_i18n,
+            },
+        )
+        return data.get("recordresult") or []
 
     # ------------------------------------------------------------------
     # 重试与错误分类（内部实现）
