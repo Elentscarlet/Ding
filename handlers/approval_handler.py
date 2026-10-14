@@ -106,32 +106,32 @@ class ApprovalEventHandler(dingtalk_stream.EventHandler):
 
             query_res = self.api.get_vacation_quota(user_id, self.cfg.reward_leave_code)
             # 解析剩余假期
-            remaining_days = None
+            remaining_hours = None
             used = 0
             if query_res.get("errcode") == 0:
                 quotas = query_res.get("result", {}).get("leave_quotas", [])
                 if quotas:
                     q = quotas[0]
-                    total = q.get("quota_num_per_day", 0)  # 总余额，百分之一天
-                    used = q.get("used_num_per_day", 0)  # 已使用，百分之一天
-                    remaining_days = (total - used) / 100.0  # 转为天
-                    used = used / 100.0
+                    total = q.get("quota_num_per_hour", 0)  # 总余额，百分之一小时
+                    used = q.get("used_num_per_hour", 0)  # 已使用，百分之一小时
+                    remaining_hours = (total - used) / 100.0  # 转为小时
+                    used = used / 100.0 # 转为小时
 
-            if remaining_days is not None:
+            if remaining_hours is not None:
                 self.logger.info(
-                    "用户当前剩余假期 | userId=%s | 剩余=%s天 | 已使用=%s天",
-                    user_id, remaining_days,used
+                    "用户当前剩余假期 | userId=%s | 剩余=%s小时 | 已使用=%s小时",
+                    user_id, remaining_hours,used
                 )
             else:
                 self.logger.warning("未能获取剩余假期 | userId=%s", user_id)
-                remaining_days = 0
+                remaining_hours = 0
 
             # 3. 调用 API 累加假期余额
-            days = days + used + remaining_days
+            hours = days * 6 + used + remaining_hours
             result = self.api.update_vacation_quota(
                 user_id=user_id,
                 leave_code=self.cfg.reward_leave_code,
-                days=days,
+                days=days, hours=hours,
             )
             self.logger.info("假期余额更新成功: %s", result)
 

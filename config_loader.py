@@ -71,18 +71,15 @@ class CheckinConfig:
 
 
 @dataclass
-class WebConfig:
-    """打卡记录查询页（钉钉工作台 H5）配置。"""
+class RobotConfig:
+    """外勤打卡查询机器人配置。"""
     enabled: bool = False
-    host: str = "0.0.0.0"
-    port: int = 8080
-    auth_mode: str = "dingtalk"        # dingtalk = 免登+白名单；none = 不鉴权（仅本机调试）
-    corp_id: str = ""
-    agent_id: str = ""
     admin_user_ids: List[str] = field(default_factory=list)
-    session_secret: str = ""
-    session_ttl: int = 8 * 3600        # 会话有效期（秒）
-    export_limit: int = 20000          # 单次导出行数上限
+    robot_code: str = ""               # 留空则用 dingtalk.client_id
+    default_range_days: int = 7        # 不写日期时默认查最近几天
+    max_summary_rows: int = 30         # 聊天里最多展示多少条（地点/日期）
+    export_limit: int = 20000          # 单次导出上限行数
+    file_name_prefix: str = "外勤打卡记录"
 
 
 @dataclass
@@ -92,38 +89,32 @@ class AppConfig:
     logging: LoggingConfig
     connection: ConnectionConfig
     checkin: CheckinConfig = field(default_factory=CheckinConfig)
-    web: WebConfig = field(default_factory=WebConfig)
+    robot: RobotConfig = field(default_factory=RobotConfig)
 
 
-def _build_web_config(raw: dict) -> WebConfig:
-    wb = raw.get("web") or {}
-    cfg = WebConfig(
-        enabled=bool(wb.get("enabled", False)),
-        host=str(wb.get("host", "0.0.0.0")),
-        port=int(wb.get("port", 8080)),
-        auth_mode=str(wb.get("auth_mode", "dingtalk")).strip().lower(),
-        corp_id=str(wb.get("corp_id", "")).strip(),
-        agent_id=str(wb.get("agent_id", "")).strip(),
-        admin_user_ids=[str(u).strip() for u in (wb.get("admin_user_ids") or []) if str(u).strip()],
-        session_secret=os.environ.get("WEB_SESSION_SECRET") or str(wb.get("session_secret", "")),
-        session_ttl=int(wb.get("session_ttl", 8 * 3600)),
-        export_limit=int(wb.get("export_limit", 20000)),
+def _build_robot_config(raw: dict) -> RobotConfig:
+    rb = raw.get("robot") or {}
+    cfg = RobotConfig(
+        enabled=bool(rb.get("enabled", False)),
+        admin_user_ids=[str(u).strip() for u in (rb.get("admin_user_ids") or [])
+                        if str(u).strip()],
+        robot_code=str(rb.get("robot_code", "")).strip(),
+        default_range_days=int(rb.get("default_range_days", 7)),
+        max_summary_rows=int(rb.get("max_summary_rows", 30)),
+        export_limit=int(rb.get("export_limit", 20000)),
+        file_name_prefix=str(rb.get("file_name_prefix", "外勤打卡记录")).strip()
+        or "外勤打卡记录",
     )
 
     if cfg.enabled:
-        if cfg.auth_mode not in ("dingtalk", "none"):
-            raise ValueError("web.auth_mode 只能是 dingtalk 或 none")
-        if not (1 <= cfg.port <= 65535):
-            raise ValueError("web.port 取值非法")
-        if cfg.session_ttl <= 0:
-            raise ValueError("web.session_ttl 必须大于 0")
-        if cfg.auth_mode == "dingtalk":
-            if not cfg.corp_id:
-                raise ValueError("web.corp_id 未配置（钉钉企业 corpId）")
-            if not cfg.agent_id:
-                raise ValueError("web.agent_id 未配置（应用的 AgentId）")
-            if not cfg.admin_user_ids:
-                raise ValueError("web.admin_user_ids 未配置（允许查看记录的白名单 userId）")
+        if not cfg.admin_user_ids:
+            raise ValueError("robot.admin_user_ids 未配置（允许使用机器人的白名单 userId）")
+        if cfg.default_range_days < 1:
+            raise ValueError("robot.default_range_days 必须大于 0")
+        if cfg.max_summary_rows < 1:
+            raise ValueError("robot.max_summary_rows 必须大于 0")
+        if cfg.export_limit < 1:
+            raise ValueError("robot.export_limit 必须大于 0")
 
     return cfg
 
@@ -243,7 +234,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     )
 
     checkin_cfg = _build_checkin_config(raw)
-    web_cfg = _build_web_config(raw)
+    robot_cfg = _build_robot_config(raw)
 
     return AppConfig(
         dingtalk=DingTalkConfig(client_id, client_secret),
@@ -251,5 +242,5 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         logging=logging_cfg,
         connection=conn_cfg,
         checkin=checkin_cfg,
-        web=web_cfg,
+        robot=robot_cfg,
     )

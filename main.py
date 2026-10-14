@@ -8,6 +8,7 @@ import os
 import signal
 import threading
 import time
+from datetime import timedelta, timezone
 
 import dingtalk_stream
 
@@ -17,8 +18,8 @@ from config_loader import load_config
 from db import CheckinStore, UserStore
 from handlers import ApprovalEventHandler
 from logger_setup import setup_logger
+from robot_handler import CheckinRobotHandler
 from stream_runner import StreamRunner
-from web_server import WebServer
 
 
 def main():
@@ -46,7 +47,7 @@ def main():
     )
     client = dingtalk_stream.DingTalkStreamClient(credential, logger=logger)
 
-    # 4. 注册事件处理器
+    # 4. 注册审批事件处理器
     client.register_all_event_handler(
         ApprovalEventHandler(cfg.approval, api, logger)
     )
@@ -55,11 +56,12 @@ def main():
     checkin_store = None
     user_store = None
     checkin_poller = None
-    web_server = None
 
-    if cfg.checkin.enabled or cfg.web.enabled:
+    if cfg.checkin.enabled or cfg.robot.enabled:
         checkin_store = CheckinStore(cfg.checkin.mongo, logger)
         user_store = UserStore(cfg.checkin.mongo, logger)
+
+    tz = timezone(timedelta(hours=cfg.checkin.utc_offset_hours))
 
     if cfg.checkin.enabled:
         checkin_poller = CheckinPoller(
@@ -68,21 +70,27 @@ def main():
     else:
         logger.info("外勤打卡轮询未启用（checkin.enabled = false）")
 
-    if cfg.web.enabled:
-        web_server = WebServer(
-            cfg.web, api, checkin_store, user_store,
-            cfg.checkin.utc_offset_hours, logger,
+    # 注册机器人消息处理器（回调按 topic 挂在 map 里，不会顶掉审批事件处理器）
+    if cfg.robot.enabled:
+        client.register_callback_handler(
+            dingtalk_stream.ChatbotMessage.TOPIC,
+            CheckinRobotHandler(
+                cfg.robot, api, checkin_store, user_store, tz,
+                cfg.checkin.places, logger,
+            ),
+        )
+        logger.info(
+            "外勤打卡查询机器人已启用 | 白名单=%d 人 | 默认查询最近 %d 天",
+            len(cfg.robot.admin_user_ids), cfg.robot.default_range_days,
         )
     else:
-        logger.info("打卡查询页未启用（web.enabled = false）")
+        logger.info("外勤打卡查询机器人未启用（robot.enabled = false）")
 
-    # 6. 启动 Stream 运行器、轮询任务与查询页
+    # 6. 启动 Stream 运行器与轮询任务
     runner = StreamRunner(client, cfg, logger)
     runner.start()
     if checkin_poller is not None:
         checkin_poller.start()
-    if web_server is not None:
-        web_server.start()
 
     # 7. 等待退出信号
     stop_event = threading.Event()
@@ -103,8 +111,6 @@ def main():
         runner.stop()
         if checkin_poller is not None:
             checkin_poller.stop()
-        if web_server is not None:
-            web_server.stop()
         logger.info("程序已退出")
 
 

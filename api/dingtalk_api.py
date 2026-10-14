@@ -8,6 +8,7 @@
   - 错误分类 + 退避重试（区分"可安全重试"与"不可重试"）
 """
 
+import json
 import logging
 import random
 import re
@@ -156,7 +157,7 @@ class DingTalkApiClient:
     # 批量更新假期余额
     # ------------------------------------------------------------------
     def update_vacation_quota(self, user_id: str, leave_code: str,
-                              days: float,
+                              days: float,hours: float ,
                               reason: str = "OA审批通过自动发放奖励假期") -> dict:
         url = f"{self.OAPI_BASE}/topapi/attendance/vacation/quota/update"
         params = {"access_token": self.get_access_token()}
@@ -172,6 +173,7 @@ class DingTalkApiClient:
                     "userid": user_id,
                     "leave_code": leave_code,
                     "quota_num_per_day": int(round(days * 100)),
+                    "quota_num_per_hour": int(round(hours * 100)),
                     "quota_cycle": str(time.localtime().tm_year),
                     "start_time": now_ms,
                     "end_time": one_year_later_ms,
@@ -372,6 +374,67 @@ class DingTalkApiClient:
             },
         )
         return data.get("recordresult") or []
+
+    # ------------------------------------------------------------------
+    # 机器人：媒体上传与文件消息
+    # ------------------------------------------------------------------
+    def upload_media(self, content: bytes, filename: str,
+                     media_type: str = "file") -> str:
+        """上传媒体文件，返回 media_id。
+
+        type=file 支持 xls/xlsx/doc/docx/ppt/pptx/zip/pdf/rar，最大 20MB。
+        上传本身可安全重试（最多多产生几个用不到的 media_id），按幂等处理。
+        """
+        url = f"{self.OAPI_BASE}/media/upload"
+        data = self._call(
+            "POST", url,
+            idempotent=True,
+            describe=f"上传媒体文件({filename}, {len(content)} 字节)",
+            params={"access_token": self.get_access_token(), "type": media_type},
+            data={"type": media_type},
+            files={"media": (filename, content)},
+        )
+        media_id = data.get("media_id")
+        if not media_id:
+            raise DingTalkApiError(f"上传媒体文件未返回 media_id: {data}")
+        return media_id
+
+    def send_file_to_user(self, user_id: str, content: bytes, filename: str,
+                          file_type: str = "xlsx", robot_code: str = "") -> dict:
+        """给单个用户发文件消息（人与机器人的单聊）。
+
+        发消息不是幂等操作：网络超时后重试可能让用户收到两份文件，
+        所以只有服务端明确拒绝（限流等）才重试。
+        """
+        robot_code = robot_code or self.client_id
+        media_id = self.upload_media(content, filename)
+
+        url = f"{self.API_BASE}/v1.0/robot/oToMessages/batchSend"
+        headers = {"x-acs-dingtalk-access-token": self.get_access_token()}
+        body = {
+            "robotCode": robot_code,
+            "userIds": [user_id],
+            "msgKey": "sampleFile",
+            "msgParam": json.dumps(
+                {"mediaId": media_id, "fileName": filename, "fileType": file_type},
+                ensure_ascii=False,
+            ),
+        }
+        data = self._call(
+            "POST", url,
+            idempotent=False,
+            describe=f"发送文件消息({filename} -> {user_id})",
+            headers=headers,
+            json=body,
+        )
+
+        if user_id in (data.get("invalidStaffIdList") or []):
+            raise DingTalkApiError(
+                f"文件消息发送失败：用户 {user_id} 无效或不在应用可见范围内 | {data}"
+            )
+        if user_id in (data.get("flowControlledStaffIdList") or []):
+            raise DingTalkApiError(f"文件消息被限流，请稍后再试 | {data}")
+        return data
 
     # ------------------------------------------------------------------
     # 重试与错误分类（内部实现）
