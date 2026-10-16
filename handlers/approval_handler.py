@@ -89,7 +89,7 @@ class RewardLeaveHandler:
             if not user_id:
                 self.logger.warning("未获取到 originatorUserId，跳过发放")
                 return
-            if not days or days <= 0:
+            if (not days or days <= 0) and not (hours or hours <= 0):
                 self.logger.warning("未解析到有效奖励天数，跳过发放 | days=%s", days)
                 return
 
