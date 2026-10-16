@@ -3,7 +3,7 @@
 import os
 import re
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 import yaml
 
@@ -83,6 +83,37 @@ class RobotConfig:
 
 
 @dataclass
+class ApprovalRuleConfig:
+    """一条审批提交校验规则。"""
+    field: str                      # 定位组件：name / id / bizAlias / componentType
+    type: str                       # number_range | date_compare | ext_value_compare
+    message: str = ""               # 自定义未通过提示；留空则自动生成
+    min: Optional[float] = None     # number_range 下限（可只填一个）
+    max: Optional[float] = None     # number_range 上限
+    op: str = ""                    # 比较符 gt/ge/lt/le/eq/ne
+    compare_field: str = ""         # date_compare 的对比字段；填 @now 表示当前时间
+    left_key: str = ""              # ext_value_compare：组件 extValue 里的左值 key
+    right_key: str = ""             # ext_value_compare：组件 extValue 里的右值 key
+    tolerance: float = 0.0          # ext_value_compare 数值比较容差
+    ignore_right: List[str] = field(default_factory=list)
+    # ignore_right：把这些右值视为"未自定义"并跳过比较；留空 = 严格比较（默认）
+
+
+@dataclass
+class ApprovalCheckConfig:
+    """审批提交校验（提交时校验，未通过直接驳回）。"""
+    enabled: bool = False
+    process_code: str = ""
+    actioner_user_id: str = ""      # 驳回操作人：仅当任务里取不到 userId 时的兜底
+    remark_prefix: str = "系统校验未通过："
+    task_wait_retries: int = 5      # 待办任务未生成时的重试次数
+    task_wait_interval: float = 1.0 # 每次重试间隔（秒）
+    on_missing_field: str = "skip"  # 表单里找不到字段时：skip | reject
+    dry_run: bool = False           # true = 只记录不驳回（上线观察用）
+    rules: List[ApprovalRuleConfig] = field(default_factory=list)
+
+
+@dataclass
 class AppConfig:
     dingtalk: DingTalkConfig
     approval: ApprovalConfig
@@ -90,6 +121,7 @@ class AppConfig:
     connection: ConnectionConfig
     checkin: CheckinConfig = field(default_factory=CheckinConfig)
     robot: RobotConfig = field(default_factory=RobotConfig)
+    approval_check: ApprovalCheckConfig = field(default_factory=ApprovalCheckConfig)
 
 
 def _build_robot_config(raw: dict) -> RobotConfig:
@@ -191,6 +223,112 @@ def _build_checkin_config(raw: dict) -> CheckinConfig:
     return cfg
 
 
+_RULE_TYPES = ("number_range", "date_compare", "ext_value_compare")
+_COMPARE_OPS = ("gt", "ge", "lt", "le", "eq", "ne")
+_ON_MISSING = ("skip", "reject")
+
+
+def _optional_float(value, field: str, key: str):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"approval_check.rules[{field}].{key} 必须是数字: {value!r}") from e
+
+
+def _build_approval_check_config(raw: dict) -> ApprovalCheckConfig:
+    ac = raw.get("approval_check") or {}
+
+    rules: List[ApprovalRuleConfig] = []
+    for item in ac.get("rules") or []:
+        item_field = str(item.get("field", "")).strip()
+        rule_type = str(item.get("type", "")).strip()
+        if not item_field:
+            raise ValueError("approval_check.rules[].field 未配置")
+        if rule_type not in _RULE_TYPES:
+            raise ValueError(
+                f"approval_check.rules[{item_field}].type 只支持 {_RULE_TYPES}，"
+                f"当前为 {rule_type!r}"
+            )
+
+        rule = ApprovalRuleConfig(
+            field=item_field,
+            type=rule_type,
+            message=str(item.get("message", "")).strip(),
+            min=_optional_float(item.get("min"), item_field, "min"),
+            max=_optional_float(item.get("max"), item_field, "max"),
+            op=str(item.get("op", "")).strip().lower(),
+            compare_field=str(item.get("compare_field", "")).strip(),
+            left_key=str(item.get("left_key", "")).strip(),
+            right_key=str(item.get("right_key", "")).strip(),
+            tolerance=_optional_float(item.get("tolerance"), item_field, "tolerance") or 0.0,
+            ignore_right=[str(v).strip() for v in (item.get("ignore_right") or [])
+                          if str(v).strip() != ""],
+        )
+
+        if rule_type == "number_range":
+            if rule.min is None and rule.max is None:
+                raise ValueError(
+                    f"approval_check.rules[{item_field}] 至少需要 min 或 max 之一"
+                )
+            if rule.min is not None and rule.max is not None and rule.min > rule.max:
+                raise ValueError(f"approval_check.rules[{item_field}] 的 min 不能大于 max")
+        elif rule_type == "date_compare":
+            if rule.op not in _COMPARE_OPS:
+                raise ValueError(
+                    f"approval_check.rules[{item_field}].op 只支持 {_COMPARE_OPS}，"
+                    f"当前为 {rule.op!r}"
+                )
+            if not rule.compare_field:
+                raise ValueError(
+                    f"approval_check.rules[{item_field}].compare_field 未配置"
+                )
+        else:   # ext_value_compare
+            if not rule.left_key or not rule.right_key:
+                raise ValueError(
+                    f"approval_check.rules[{item_field}] 需要同时配置 left_key 与 right_key"
+                )
+            if not rule.op:
+                rule.op = "eq"          # 一致性比对默认等值
+            if rule.op not in _COMPARE_OPS:
+                raise ValueError(
+                    f"approval_check.rules[{item_field}].op 只支持 {_COMPARE_OPS}，"
+                    f"当前为 {rule.op!r}"
+                )
+            if rule.tolerance < 0:
+                raise ValueError(f"approval_check.rules[{item_field}].tolerance 不能为负")
+        rules.append(rule)
+
+    cfg = ApprovalCheckConfig(
+        enabled=bool(ac.get("enabled", False)),
+        process_code=str(ac.get("process_code", "")).strip(),
+        actioner_user_id=str(ac.get("actioner_user_id", "")).strip(),
+        remark_prefix=str(ac.get("remark_prefix", "系统校验未通过：")),
+        task_wait_retries=int(ac.get("task_wait_retries", 5)),
+        task_wait_interval=float(ac.get("task_wait_interval", 1.0)),
+        on_missing_field=str(ac.get("on_missing_field", "skip")).strip().lower(),
+        dry_run=bool(ac.get("dry_run", False)),
+        rules=rules,
+    )
+
+    if cfg.enabled:
+        if not cfg.process_code:
+            raise ValueError("approval_check.process_code 未配置")
+        # actioner_user_id 不再是必填：默认用当前待办任务的审批人，
+        # 这里只是任务里取不到 userId 时的兜底。
+        if not cfg.rules:
+            raise ValueError("approval_check.rules 未配置")
+        if cfg.task_wait_retries < 1:
+            raise ValueError("approval_check.task_wait_retries 必须大于 0")
+        if cfg.task_wait_interval < 0:
+            raise ValueError("approval_check.task_wait_interval 不能为负")
+        if cfg.on_missing_field not in _ON_MISSING:
+            raise ValueError(f"approval_check.on_missing_field 只支持 {_ON_MISSING}")
+
+    return cfg
+
+
 def load_config(path: str = "config.yaml") -> AppConfig:
     if not os.path.exists(path):
         raise FileNotFoundError(f"配置文件不存在: {path}")
@@ -235,6 +373,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
 
     checkin_cfg = _build_checkin_config(raw)
     robot_cfg = _build_robot_config(raw)
+    approval_check_cfg = _build_approval_check_config(raw)
 
     return AppConfig(
         dingtalk=DingTalkConfig(client_id, client_secret),
@@ -243,4 +382,5 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         connection=conn_cfg,
         checkin=checkin_cfg,
         robot=robot_cfg,
+        approval_check=approval_check_cfg,
     )
