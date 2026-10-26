@@ -54,6 +54,7 @@ HELP_TEXT = "  \n".join([
     "**地点**：查看已配置的外勤地点",
     "",
     "**余额**：奖励假期一览表（姓名 / 初始 / 增加 / 请假 / 余额，默认今年至今）",
+    "**余额 天**：同一张表按天显示（默认按小时）",
     "**余额 全部**：不按年截断，统计全部历史记录",
     "**导出余额**：生成 Excel 私发给你（汇总 + 变更明细两个 sheet）",
     "",
@@ -86,10 +87,13 @@ def parse_command(text: str, place_names: Sequence[str] = (),
     lowered = (text or "").lower()
     if any(word in lowered for word in BALANCE_WORDS):
         is_export = any(word in lowered for word in EXPORT_WORDS)
+        # 默认按小时展示；tokens 里出现「天」才折算成天（避免「今天」被误判）
+        unit = "day" if any(t in ("天", "按天", "day", "days") for t in tokens) else "hour"
         return {
             "action": "balance_export" if is_export else "balance",
             "from": None, "to": None, "place": None, "note": None,
             "all": any(word in lowered for word in BALANCE_ALL_WORDS),
+            "unit": unit,
         }
 
     action = "query"
@@ -364,7 +368,10 @@ class CheckinRobotHandler(AsyncChatbotHandler):
             self._reply(incoming, "查询失败", f"查询出错了：{e}")
             return
 
-        body = format_balance_markdown(result, max_rows=self.cfg.max_summary_rows)
+        body = format_balance_markdown(
+            result, max_rows=self.cfg.max_summary_rows,
+            unit=command.get("unit") or "hour",
+        )
         self._reply(incoming, "奖励假期余额", body)
 
     def balance_export(self, incoming: ChatbotMessage, command: dict):

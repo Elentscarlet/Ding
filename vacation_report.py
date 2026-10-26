@@ -16,7 +16,8 @@
   对账：初始 + 增加 - 请假 应等于 余额；不等时在「校验」列标出差额，
         避免静默算错（例如初始化记录落在统计区间之外）。
 
-所有金额内部按**小时**存，展示时按 hours_per_day 折算成天。
+所有额度内部按**小时**存储；聊天里的表格默认按**小时**展示
+（format_balance_markdown 传 unit="day" 可切回天），Excel 同时给出天与小时两列。
 """
 
 import io
@@ -294,6 +295,17 @@ def fmt_days(hours: float, hours_per_day: float) -> str:
     return text if text not in ("", "-0") else "0"
 
 
+def fmt_hours(hours: float) -> str:
+    """小时 -> 展示文本（最多两位小数，去掉多余的 0）。"""
+    text = f"{round(hours, 2):.2f}".rstrip("0").rstrip(".")
+    return text if text not in ("", "-0") else "0"
+
+
+def balance_cell(hours: float, hours_per_day: float, unit: str = "hour") -> str:
+    """按指定单位渲染一个数值单元格；unit 为 day 时折算成天。"""
+    return fmt_days(hours, hours_per_day) if unit == "day" else fmt_hours(hours)
+
+
 def _display_width(text: str) -> int:
     """东亚全角字符按 2 列宽计算，用于等宽对齐。"""
     return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
@@ -304,9 +316,16 @@ def _pad(text: str, width: int) -> str:
     return text + " " * max(0, width - _display_width(text))
 
 
-def format_balance_markdown(result: dict, max_rows: int = 30) -> str:
-    """渲染成机器人回复：标题 + 说明 + 等宽表格 + 合计 + 对账提示。"""
+def format_balance_markdown(result: dict, max_rows: int = 30,
+                            unit: str = "hour") -> str:
+    """渲染成机器人回复：标题 + 说明 + 等宽表格 + 合计 + 对账提示。
+
+    :param unit: 表格里的数值单位，默认 "hour"（小时）；传 "day" 则折算成天
+    """
     hours_per_day = result["hours_per_day"]
+    unit = "day" if str(unit).lower().startswith("d") else "hour"
+    unit_text = (f"天（1 天 = {_num(hours_per_day)} 小时）" if unit == "day"
+                 else f"小时（1 天 = {_num(hours_per_day)} 小时）")
     start, end = result["start"], result["end"]
     range_text = (
         f"{start.strftime('%Y-%m-%d')} ~ {end.strftime('%Y-%m-%d')}"
@@ -315,7 +334,7 @@ def format_balance_markdown(result: dict, max_rows: int = 30) -> str:
 
     header = [
         "### 奖励假期余额一览",
-        f"**统计区间**：{range_text}　**单位**：天（1 天 = {_num(hours_per_day)} 小时）",
+        f"**统计区间**：{range_text}　**单位**：{unit_text}",
         f"**范围**：扫描 {result['scanned']} 人，其中 {len(result['rows'])} 人有奖励假期数据",
     ]
 
@@ -328,17 +347,17 @@ def format_balance_markdown(result: dict, max_rows: int = 30) -> str:
     for row in rows[:max_rows]:
         body.append([
             row["name"],
-            fmt_days(row["init_hours"], hours_per_day),
-            fmt_days(row["grant_hours"], hours_per_day),
-            fmt_days(row["leave_hours"], hours_per_day),
-            fmt_days(row["balance_hours"], hours_per_day),
+            balance_cell(row["init_hours"], hours_per_day, unit),
+            balance_cell(row["grant_hours"], hours_per_day, unit),
+            balance_cell(row["leave_hours"], hours_per_day, unit),
+            balance_cell(row["balance_hours"], hours_per_day, unit),
         ])
     body.append([
         "合计",
-        fmt_days(totals["init_hours"], hours_per_day),
-        fmt_days(totals["grant_hours"], hours_per_day),
-        fmt_days(totals["leave_hours"], hours_per_day),
-        fmt_days(totals["balance_hours"], hours_per_day),
+        balance_cell(totals["init_hours"], hours_per_day, unit),
+        balance_cell(totals["grant_hours"], hours_per_day, unit),
+        balance_cell(totals["leave_hours"], hours_per_day, unit),
+        balance_cell(totals["balance_hours"], hours_per_day, unit),
     ])
 
     widths = [
