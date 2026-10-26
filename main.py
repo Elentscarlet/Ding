@@ -16,7 +16,8 @@ from api import DingTalkApiClient
 from checkin_poller import CheckinPoller
 from config_loader import load_config
 from db import CheckinStore, UserStore
-from handlers import ApprovalEventHandler
+from handlers import (ApprovalCheckHandler, ApprovalEventRouter,
+                      RewardLeaveHandler)
 from logger_setup import setup_logger
 from robot_handler import CheckinRobotHandler
 from stream_runner import StreamRunner
@@ -48,8 +49,22 @@ def main():
     client = dingtalk_stream.DingTalkStreamClient(credential, logger=logger)
 
     # 4. 注册审批事件处理器
+    #    注意：SDK 的 register_all_event_handler 是单槽位覆盖，只能注册一个 EventHandler，
+    #    所以要占住这个槽位后按 processCode 自己分发，否则后注册的会顶掉前面的。
+    tz = timezone(timedelta(hours=cfg.checkin.utc_offset_hours))
+
+    approval_handlers = [RewardLeaveHandler(cfg.approval, api, logger)]
+    approval_check_handler = None
+    if cfg.approval_check.enabled:
+        approval_check_handler = ApprovalCheckHandler(
+            cfg.approval_check, api, tz, logger
+        )
+        approval_handlers.append(approval_check_handler)
+    else:
+        logger.info("审批提交校验未启用（approval_check.enabled = false）")
+
     client.register_all_event_handler(
-        ApprovalEventHandler(cfg.approval, api, logger)
+        ApprovalEventRouter(approval_handlers, logger)
     )
 
     # 5. 准备依赖 MongoDB 的组件（构造失败会直接退出，不会留下半启动状态）
@@ -60,8 +75,6 @@ def main():
     if cfg.checkin.enabled or cfg.robot.enabled:
         checkin_store = CheckinStore(cfg.checkin.mongo, logger)
         user_store = UserStore(cfg.checkin.mongo, logger)
-
-    tz = timezone(timedelta(hours=cfg.checkin.utc_offset_hours))
 
     if cfg.checkin.enabled:
         checkin_poller = CheckinPoller(
@@ -120,6 +133,8 @@ def main():
         runner.stop()
         if checkin_poller is not None:
             checkin_poller.stop()
+        if approval_check_handler is not None:
+            approval_check_handler.shutdown()
         logger.info("程序已退出")
 
 

@@ -461,6 +461,37 @@ class DingTalkApiClient:
         return data.get("recordresult") or []
 
     # ------------------------------------------------------------------
+    # 审批：同意 / 拒绝任务
+    # ------------------------------------------------------------------
+    def execute_process_instance(self, process_instance_id: str, task_id,
+                                 result: str, actioner_user_id: str,
+                                 remark: str = "") -> dict:
+        """同意或拒绝一个审批任务。
+
+        注意：对**单个任务**执行 refuse，整个审批流程就会结束（即"驳回"）。
+        非幂等：超时/5xx 后不重试，避免重复操作审批任务。
+        """
+        if result not in ("agree", "refuse"):
+            raise ValueError(f"result 只能是 agree 或 refuse，收到 {result!r}")
+
+        url = f"{self.API_BASE}/v1.0/workflow/processInstances/execute"
+        headers = {"x-acs-dingtalk-access-token": self.get_access_token()}
+        body = {
+            "processInstanceId": process_instance_id,
+            "taskId": int(task_id),
+            "result": result,
+            "actionerUserId": actioner_user_id,
+            "remark": remark,
+        }
+        return self._call(
+            "POST", url,
+            idempotent=False,
+            describe=f"{'同意' if result == 'agree' else '拒绝'}审批任务({process_instance_id})",
+            headers=headers,
+            json=body,
+        )
+
+    # ------------------------------------------------------------------
     # 机器人：媒体上传与文件消息
     # ------------------------------------------------------------------
     def upload_media(self, content: bytes, filename: str,
