@@ -64,6 +64,11 @@ def _as_bool(value) -> bool:
     return bool(value)
 
 
+def _chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 class DingTalkApiClient:
     OAPI_BASE = "https://oapi.dingtalk.com"
     API_BASE = "https://api.dingtalk.com"
@@ -205,6 +210,86 @@ class DingTalkApiClient:
                 retryable=False,
             )
         return data
+
+    # ------------------------------------------------------------------
+    # 假期：批量查询余额 / 余额变更记录
+    # ------------------------------------------------------------------
+    # 两个接口都是「一次最多 50 个 userId」
+    MAX_VACATION_USER_IDS = 50
+
+    def list_vacation_quotas(self, user_ids, leave_code: str) -> dict:
+        """批量查询假期余额，返回 {userid: [额度记录, ...]}。
+
+        同一个员工可能有多个额度周期（不同 quota_cycle），所以值是一个列表，
+        由调用方挑选要用的周期。
+        """
+        url = f"{self.OAPI_BASE}/topapi/attendance/vacation/quota/list"
+        quotas: dict = {}
+
+        for chunk in _chunks(list(user_ids), self.MAX_VACATION_USER_IDS):
+            offset = 0
+            for _ in range(20):
+                data = self._call(
+                    "POST", url,
+                    idempotent=True,
+                    describe=f"查询假期余额({len(chunk)}人)",
+                    params={"access_token": self.get_access_token()},
+                    json={
+                        "userids": ",".join(chunk),
+                        "leave_code": leave_code,
+                        "op_userid": self.admin_user_id,
+                        "offset": offset,
+                        "size": len(chunk),
+                    },
+                )
+                result = data.get("result") or {}
+                page = result.get("leave_quotas") or []
+                for item in page:
+                    uid = item.get("userid")
+                    if uid:
+                        quotas.setdefault(uid, []).append(item)
+                if not _as_bool(result.get("has_more")) or not page:
+                    break
+                offset += len(page)
+
+        return quotas
+
+    def list_vacation_records(self, user_ids, leave_code: str,
+                              page_size: int = 200,
+                              max_pages: int = 50) -> list:
+        """批量查询假期余额变更记录（含初始化 / 发放 / 请假）。
+
+        注意分页语义：文档里 pageNumber 写的是「偏移量的累积值」，
+        实测它表示**已取记录条数**（size=2 时传 1 会从第 2 条开始），
+        所以每一页用它累加，不是页码。
+        """
+        url = f"{self.API_BASE}/v1.0/attendance/vacations/records/query"
+        records: list = []
+
+        for chunk in _chunks(list(user_ids), self.MAX_VACATION_USER_IDS):
+            offset = 0
+            for _ in range(max_pages):
+                data = self._call(
+                    "POST", url,
+                    idempotent=True,
+                    describe=f"查询假期变更记录({len(chunk)}人)",
+                    headers={"x-acs-dingtalk-access-token": self.get_access_token()},
+                    json={
+                        "opUserId": self.admin_user_id,
+                        "leaveCode": leave_code,
+                        "userIds": list(chunk),
+                        "pageNumber": offset,
+                        "pageSize": page_size,
+                    },
+                )
+                result = data.get("result") or {}
+                page = result.get("leaveRecords") or []
+                records.extend(page)
+                if not _as_bool(result.get("hasMore")) or not page:
+                    break
+                offset += len(page)
+
+        return records
 
     # ------------------------------------------------------------------
     # 通讯录：子部门 / 部门成员

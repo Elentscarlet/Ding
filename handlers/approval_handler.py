@@ -127,7 +127,7 @@ class ApprovalEventHandler(dingtalk_stream.EventHandler):
                 remaining_hours = 0
 
             # 3. 调用 API 累加假期余额
-            hours = days * 6 + used + remaining_hours
+            hours = days * self.cfg.hours_per_day + used + remaining_hours
             result = self.api.update_vacation_quota(
                 user_id=user_id,
                 leave_code=self.cfg.reward_leave_code,

@@ -24,8 +24,11 @@ from typing import List, Optional, Sequence
 from dingtalk_stream import AckMessage
 from dingtalk_stream.chatbot import AsyncChatbotHandler, ChatbotMessage
 
+from api import DingTalkApiError
 from checkin_report import (build_result, build_workbook, export_row_groups,
                             format_summary_markdown)
+from vacation_report import (balance_range, build_balance,
+                             build_balance_workbook, format_balance_markdown)
 
 # 只匹配 2026-10-13 / 2026-1-3 这类写法，后续再交给 strptime 校验
 DATE_RE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}")
@@ -34,6 +37,9 @@ EXPORT_WORDS = ("导出", "下载", "export", "excel")
 QUERY_WORDS = ("查询", "查", "query", "记录")
 HELP_WORDS = ("帮助", "help", "?", "？", "你好", "hello")
 PLACE_WORDS = ("地点", "地点列表", "places")
+# 余额一览表：出现这些词就走余额分支（不看日期）
+BALANCE_WORDS = ("余额", "额度", "balance")
+BALANCE_ALL_WORDS = ("全部", "全历史", "all")
 
 HELP_TEXT = "  \n".join([
     "**外勤打卡记录查询**",
@@ -46,6 +52,10 @@ HELP_TEXT = "  \n".join([
     "**导出 [同上]**：生成 Excel 私发给你（含汇总 + 明细两个 sheet）",
     "",
     "**地点**：查看已配置的外勤地点",
+    "",
+    "**余额**：奖励假期一览表（姓名 / 初始 / 增加 / 请假 / 余额，默认今年至今）",
+    "**余额 全部**：不按年截断，统计全部历史记录",
+    "**导出余额**：生成 Excel 私发给你（汇总 + 变更明细两个 sheet）",
     "",
     "**帮助**：显示本说明",
 ])
@@ -71,6 +81,16 @@ def parse_command(text: str, place_names: Sequence[str] = (),
         return {"action": "help", "from": None, "to": None, "place": None, "note": None}
     if head in PLACE_WORDS:
         return {"action": "places", "from": None, "to": None, "place": None, "note": None}
+
+    # 余额一览表：不按日期/地点过滤，只区分「看表」还是「导出」
+    lowered = (text or "").lower()
+    if any(word in lowered for word in BALANCE_WORDS):
+        is_export = any(word in lowered for word in EXPORT_WORDS)
+        return {
+            "action": "balance_export" if is_export else "balance",
+            "from": None, "to": None, "place": None, "note": None,
+            "all": any(word in lowered for word in BALANCE_ALL_WORDS),
+        }
 
     action = "query"
     if head in EXPORT_WORDS:
@@ -143,7 +163,9 @@ def render_place_list(places: Sequence) -> str:
 # ======================================================================
 class CheckinRobotHandler(AsyncChatbotHandler):
     def __init__(self, cfg, api, checkin_store, user_store, tz: timezone,
-                 places: Sequence, logger: logging.Logger):
+                 places: Sequence, logger: logging.Logger,
+                 departments=(), leave_code: str = "",
+                 hours_per_day: float = 6.0):
         """
         :param cfg: AppConfig.robot
         :param api: DingTalkApiClient
@@ -152,6 +174,9 @@ class CheckinRobotHandler(AsyncChatbotHandler):
         :param tz: 展示用时区
         :param places: AppConfig.checkin.places
         :param logger: 日志对象
+        :param departments: (部门 ID 列表, 是否含子部门)，余额表的统计范围
+        :param leave_code: 余额表统计的假期类型（默认奖励假期）
+        :param hours_per_day: 一天折算多少小时，用于把额度换算成天
         """
         super().__init__(max_workers=4)
         self.cfg = cfg
@@ -162,6 +187,11 @@ class CheckinRobotHandler(AsyncChatbotHandler):
         self.places = list(places or [])
         self.place_names = [p.name for p in self.places]
         self.logger = logger
+        self.department_ids, self.include_sub_departments = (
+            departments if departments else ([], True)
+        )
+        self.leave_code = leave_code
+        self.hours_per_day = hours_per_day
 
     # ------------------------------------------------------------------
     # 入口（注意：AsyncChatbotHandler 要求 process 不是 async）
@@ -204,6 +234,10 @@ class CheckinRobotHandler(AsyncChatbotHandler):
             self._reply(incoming, "已配置地点", render_place_list(self.places))
         elif action == "export":
             self.export(incoming, command)
+        elif action == "balance":
+            self.balance(incoming, command)
+        elif action == "balance_export":
+            self.balance_export(incoming, command)
         else:
             self.query(incoming, command)
 
@@ -281,6 +315,107 @@ class CheckinRobotHandler(AsyncChatbotHandler):
             incoming, "导出完成",
             f"已把 **{filename}** 私发给你。  \n"
             f"汇总 {len(summary_rows)} 条（地点/日期）｜明细 {len(detail_rows)} 次打卡。  \n"
+            "没收到的话，先在钉钉里和机器人单聊一次再试。",
+        )
+
+    # ------------------------------------------------------------------
+    # 奖励假期余额一览（姓名 / 初始 / 增加 / 请假 / 余额）
+    # ------------------------------------------------------------------
+    def _build_balance(self, all_history: bool = False) -> dict:
+        if not self.department_ids:
+            raise ValueError(
+                "未配置统计范围：请在 config.yaml 的 checkin.department_ids "
+                "里填部门 ID（根部门填 1）"
+            )
+        if not self.leave_code:
+            raise ValueError(
+                "未配置假期类型：approval.reward_leave_code 为空"
+            )
+
+        users = self.api.collect_department_users(
+            self.department_ids, self.include_sub_departments
+        )
+        user_ids = [u["user_id"] for u in users if u.get("user_id")]
+        start, end, year = balance_range(self.tz, all_history)
+
+        quotas = self.api.list_vacation_quotas(user_ids, self.leave_code) \
+            if user_ids else {}
+        records = self.api.list_vacation_records(user_ids, self.leave_code) \
+            if user_ids else []
+
+        return build_balance(
+            users, quotas, records, self.tz, start, end,
+            self.hours_per_day, year,
+        )
+
+    def balance(self, incoming: ChatbotMessage, command: dict):
+        try:
+            result = self._build_balance(bool(command.get("all")))
+        except DingTalkApiError as e:
+            self.logger.error("查询奖励假期余额失败: %s", e, exc_info=True)
+            self._reply(
+                incoming, "查询失败",
+                f"钉钉接口报错：{e}  \n"
+                "常见原因：应用未开通「钉钉假期管理」权限，或 op_userid 不是管理员。",
+            )
+            return
+        except Exception as e:
+            self.logger.error("查询奖励假期余额失败: %s", e, exc_info=True)
+            self._reply(incoming, "查询失败", f"查询出错了：{e}")
+            return
+
+        body = format_balance_markdown(result, max_rows=self.cfg.max_summary_rows)
+        self._reply(incoming, "奖励假期余额", body)
+
+    def balance_export(self, incoming: ChatbotMessage, command: dict):
+        user_id = incoming.sender_staff_id
+        try:
+            result = self._build_balance(bool(command.get("all")))
+        except Exception as e:
+            self.logger.error("导出奖励假期余额失败: %s", e, exc_info=True)
+            self._reply(incoming, "导出失败", f"读取假期数据失败：{e}")
+            return
+
+        if not result["rows"]:
+            self._reply(incoming, "导出", "该范围内没有任何奖励假期数据，无需导出。")
+            return
+
+        start, end = result["start"], result["end"]
+        range_text = (
+            f"{start.strftime('%Y-%m-%d')} ~ {end.strftime('%Y-%m-%d')}"
+            if start and end else "全部历史"
+        )
+        suffix = f"{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}" \
+            if start and end else "全部历史"
+        filename = f"奖励假期余额_{suffix}.xlsx"
+        payload = build_balance_workbook(result, {
+            "range_text": range_text,
+            "exported_at": datetime.now(self.tz).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+        try:
+            self.api.send_file_to_user(
+                user_id, payload, filename,
+                file_type="xlsx", robot_code=self.cfg.robot_code,
+            )
+        except Exception as e:
+            self.logger.error("发送余额表失败 | userId=%s | %s", user_id, e, exc_info=True)
+            self._reply(
+                incoming, "导出失败",
+                f"表格已生成，但发送文件失败：{e}  \n"
+                "如果提示没有有效的单聊会话，请先在钉钉里打开机器人会话发一句话，再重试「导出余额」。",
+            )
+            return
+
+        self.logger.info(
+            "余额表已发送 | userId=%s | 文件=%s | 人数=%d | 明细=%d 条 | %d 字节",
+            user_id, filename, len(result["rows"]),
+            len(result["details"]), len(payload),
+        )
+        self._reply(
+            incoming, "导出完成",
+            f"已把 **{filename}** 私发给你。  \n"
+            f"{range_text}｜{len(result['rows'])} 人｜明细 {len(result['details'])} 条。  \n"
             "没收到的话，先在钉钉里和机器人单聊一次再试。",
         )
 

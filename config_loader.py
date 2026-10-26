@@ -19,6 +19,8 @@ class ApprovalConfig:
     reward_leave_process_code: str
     reward_leave_code: str
     admin_user_id: str
+    # 一天折算多少小时：奖励假期的额度按小时计价，发放和余额展示都要用这个系数
+    hours_per_day: float = 6.0
 
 
 @dataclass
@@ -80,6 +82,8 @@ class RobotConfig:
     max_summary_rows: int = 30         # 聊天里最多展示多少条（地点/日期）
     export_limit: int = 20000          # 单次导出上限行数
     file_name_prefix: str = "外勤打卡记录"
+    # 余额表统计的假期类型；留空则用 approval.reward_leave_code
+    vacation_leave_code: str = ""
 
 
 @dataclass
@@ -104,6 +108,7 @@ def _build_robot_config(raw: dict) -> RobotConfig:
         export_limit=int(rb.get("export_limit", 20000)),
         file_name_prefix=str(rb.get("file_name_prefix", "外勤打卡记录")).strip()
         or "外勤打卡记录",
+        vacation_leave_code=str(rb.get("vacation_leave_code", "")).strip(),
     )
 
     if cfg.enabled:
@@ -211,6 +216,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         reward_leave_process_code=ap.get("reward_leave_process_code", ""),
         reward_leave_code=ap.get("reward_leave_code", ""),
         admin_user_id=ap.get("admin_user_id", ""),
+        hours_per_day=float(ap.get("hours_per_day", 6)),
     )
     if not approval_cfg.reward_leave_process_code:
         raise ValueError("approval.reward_leave_process_code 未配置")
@@ -218,6 +224,8 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         raise ValueError("approval.reward_leave_code 未配置")
     if not approval_cfg.admin_user_id:
         raise ValueError("approval.admin_user_id 未配置")
+    if approval_cfg.hours_per_day <= 0:
+        raise ValueError("approval.hours_per_day 必须大于 0")
 
     lg = raw.get("logging", {})
     logging_cfg = LoggingConfig(

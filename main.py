@@ -77,12 +77,21 @@ def main():
             CheckinRobotHandler(
                 cfg.robot, api, checkin_store, user_store, tz,
                 cfg.checkin.places, logger,
+                departments=(cfg.checkin.department_ids,
+                             cfg.checkin.include_sub_departments),
+                leave_code=cfg.robot.vacation_leave_code
+                or cfg.approval.reward_leave_code,
+                hours_per_day=cfg.approval.hours_per_day,
             ),
         )
         logger.info(
             "外勤打卡查询机器人已启用 | 白名单=%d 人 | 默认查询最近 %d 天",
             len(cfg.robot.admin_user_ids), cfg.robot.default_range_days,
         )
+        if not cfg.checkin.department_ids:
+            logger.warning(
+                "checkin.department_ids 未配置，「余额」一览表将无法统计（根部门填 1）"
+            )
     else:
         logger.info("外勤打卡查询机器人未启用（robot.enabled = false）")
 
