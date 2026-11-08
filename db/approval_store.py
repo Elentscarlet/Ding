@@ -12,18 +12,18 @@
   - instance_id 唯一索引，重复拉取只更新不新增
   - biz_date 存 "YYYY-MM-DD" 字符串（字典序即时间序，区间查询直接用）
   - fetched_at 用于 TTL：超过 cache_ttl_days 的实例会被重新拉一次详情
+  - 这份缓存只负责"替代详情调用"；实例 ID 列表永远以接口为准，
+    查不到的（已删除）实例会被删掉
 """
 
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List
 
 from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import PyMongoError
 
 from .mongo_store import _MongoBase
-
-DEFAULT_QUERY_LIMIT = 5000
 
 
 class ApprovalStore(_MongoBase):
@@ -58,19 +58,20 @@ class ApprovalStore(_MongoBase):
             self._warn_unavailable(e)
             raise
 
-    def query(self, kinds: Optional[Iterable[str]],
-              start_date: str, end_date: str,
-              limit: int = DEFAULT_QUERY_LIMIT) -> List[dict]:
-        """按业务日期区间查缓存（start_date / end_date 为 "YYYY-MM-DD"）。"""
-        query = {"biz_date": {"$gte": start_date, "$lte": end_date}}
-        if kinds:
-            query["kind"] = {"$in": list(kinds)}
+    def get_by_ids(self, instance_ids: Iterable[str]) -> List[dict]:
+        """按 instance_id 批量取完整记录（汇总时用）。
+
+        注意：只按 ID 取，**不按日期范围捞**。缓存里的记录集合必须受
+        「接口返回的实例 ID」约束，否则已删除的实例会被重新捞进报表。
+        """
+        ids = [i for i in instance_ids if i]
+        if not ids:
+            return []
         try:
             return list(
-                self._ensure_collection()
-                .find(query, {"_id": 0})
-                .sort("biz_date", ASCENDING)
-                .limit(limit)
+                self._ensure_collection().find(
+                    {"instance_id": {"$in": ids}}, {"_id": 0}
+                )
             )
         except PyMongoError as e:
             self._warn_unavailable(e)
@@ -108,3 +109,12 @@ class ApprovalStore(_MongoBase):
             self.upsert(record)
             written += 1
         return written
+
+    def delete(self, instance_id: str) -> bool:
+        """删除一条缓存（详情接口报"实例不存在"时调用）。"""
+        try:
+            result = self._ensure_collection().delete_one({"instance_id": instance_id})
+            return (result.deleted_count or 0) > 0
+        except PyMongoError as e:
+            self._warn_unavailable(e)
+            raise
