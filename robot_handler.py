@@ -7,6 +7,11 @@
   查询 [日期] [日期] [地点]   默认最近 N 天；日期支持 今天/昨天/前天
   导出 [同上]                生成 Excel 私发给提问的人（汇总 + 明细两个 sheet）
   地点                       列出已配置的外勤地点
+  余额 [天|全部]             奖励假期一览表（默认按小时、今年至今）
+  导出余额                   余额表 Excel（汇总 + 变更明细）
+  收支 [日期区间|全部]        收入支出按月汇总（支出申请 / 存入）
+  收支明细 [同上]             逐条明细
+  导出收支                   收支明细 Excel（汇总 + 逐条）
   帮助                       使用说明
 
 鉴权：只有 robot.admin_user_ids 白名单内的人可以使用。
@@ -25,8 +30,11 @@ from dingtalk_stream import AckMessage
 from dingtalk_stream.chatbot import AsyncChatbotHandler, ChatbotMessage
 
 from api import DingTalkApiError
+from cashflow_report import (build_cashflow_workbook,
+                             format_detail_markdown,
+                             format_summary_markdown)
 from checkin_report import (build_result, build_workbook, export_row_groups,
-                            format_summary_markdown)
+                            format_summary_markdown as format_checkin_markdown)
 from vacation_report import (balance_range, build_balance,
                              build_balance_workbook, format_balance_markdown)
 
@@ -40,6 +48,8 @@ PLACE_WORDS = ("地点", "地点列表", "places")
 # 余额一览表：出现这些词就走余额分支（不看日期）
 BALANCE_WORDS = ("余额", "额度", "balance")
 BALANCE_ALL_WORDS = ("全部", "全历史", "all")
+# 收支明细：出现这些词就走收支分支
+CASHFLOW_WORDS = ("收支", "收入支出", "流水", "cashflow")
 
 HELP_TEXT = "  \n".join([
     "**外勤打卡记录查询**",
@@ -57,6 +67,12 @@ HELP_TEXT = "  \n".join([
     "**余额 天**：同一张表按天显示（默认按小时）",
     "**余额 全部**：不按年截断，统计全部历史记录",
     "**导出余额**：生成 Excel 私发给你（汇总 + 变更明细两个 sheet）",
+    "",
+    "**收支**：收入支出按月汇总（支出申请 / 存入，默认今年至今）",
+    "**收支明细**：逐条列出已审批完成的收支",
+    "**收支 2026-10-01 2026-10-31**：指定区间（也可写 今天/昨天）",
+    "**导出收支**：生成 Excel 私发给你（汇总 + 明细两个 sheet）",
+    "**收支 全部**：回看最近 365 天（接口上限）",
     "",
     "**帮助**：显示本说明",
 ])
@@ -96,6 +112,16 @@ def parse_command(text: str, place_names: Sequence[str] = (),
             "unit": unit,
         }
 
+    # 收支明细：先记下模式，日期解析完再统一返回
+    cashflow_mode = None
+    if any(word in lowered for word in CASHFLOW_WORDS):
+        if any(word in lowered for word in EXPORT_WORDS):
+            cashflow_mode = "export"
+        elif "明细" in lowered:
+            cashflow_mode = "detail"
+        else:
+            cashflow_mode = "summary"
+
     action = "query"
     if head in EXPORT_WORDS:
         action = "export"
@@ -122,6 +148,13 @@ def parse_command(text: str, place_names: Sequence[str] = (),
     if dates:
         ordered = sorted(dates)
         from_text, to_text = ordered[0], ordered[-1]
+
+    if cashflow_mode:
+        return {
+            "action": f"cashflow_{cashflow_mode}",
+            "from": from_text, "to": to_text, "place": None, "note": None,
+            "all": any(word in lowered for word in BALANCE_ALL_WORDS),
+        }
 
     place: Optional[str] = None
     note: Optional[str] = None
@@ -169,7 +202,7 @@ class CheckinRobotHandler(AsyncChatbotHandler):
     def __init__(self, cfg, api, checkin_store, user_store, tz: timezone,
                  places: Sequence, logger: logging.Logger,
                  departments=(), leave_code: str = "",
-                 hours_per_day: float = 6.0):
+                 hours_per_day: float = 6.0, cashflow=None):
         """
         :param cfg: AppConfig.robot
         :param api: DingTalkApiClient
@@ -181,6 +214,7 @@ class CheckinRobotHandler(AsyncChatbotHandler):
         :param departments: (部门 ID 列表, 是否含子部门)，余额表的统计范围
         :param leave_code: 余额表统计的假期类型（默认奖励假期）
         :param hours_per_day: 一天折算多少小时，用于把额度换算成天
+        :param cashflow: CashflowService（可为 None，此时「收支」相关指令不可用）
         """
         super().__init__(max_workers=4)
         self.cfg = cfg
@@ -196,6 +230,7 @@ class CheckinRobotHandler(AsyncChatbotHandler):
         )
         self.leave_code = leave_code
         self.hours_per_day = hours_per_day
+        self.cashflow = cashflow
 
     # ------------------------------------------------------------------
     # 入口（注意：AsyncChatbotHandler 要求 process 不是 async）
@@ -242,6 +277,12 @@ class CheckinRobotHandler(AsyncChatbotHandler):
             self.balance(incoming, command)
         elif action == "balance_export":
             self.balance_export(incoming, command)
+        elif action == "cashflow":
+            self.cashflow_summary(incoming, command)
+        elif action == "cashflow_detail":
+            self.cashflow_detail(incoming, command)
+        elif action == "cashflow_export":
+            self.cashflow_export(incoming, command)
         else:
             self.query(incoming, command)
 
@@ -267,7 +308,7 @@ class CheckinRobotHandler(AsyncChatbotHandler):
             self._reply(incoming, "查询失败", f"读取数据库失败：{e}  \n请确认 MongoDB 已启动。")
             return
 
-        body = format_summary_markdown(result, max_rows=self.cfg.max_summary_rows)
+        body = format_checkin_markdown(result, max_rows=self.cfg.max_summary_rows)
         if command.get("note"):
             body = f"（{command['note']}）  \n{body}"
         self._reply(incoming, "外勤打卡记录", body)
@@ -423,6 +464,117 @@ class CheckinRobotHandler(AsyncChatbotHandler):
             incoming, "导出完成",
             f"已把 **{filename}** 私发给你。  \n"
             f"{range_text}｜{len(result['rows'])} 人｜明细 {len(result['details'])} 条。  \n"
+            "没收到的话，先在钉钉里和机器人单聊一次再试。",
+        )
+
+    # ------------------------------------------------------------------
+    # 收入支出明细（支出申请 / 存入 两个模板）
+    # ------------------------------------------------------------------
+    def _cashflow_range(self, command: dict):
+        """把指令里的日期换算成 [start, end]；不写默认今年 1 月 1 日至今。"""
+        today = datetime.now(self.tz).date()
+        end_text = command.get("to") or today.strftime("%Y-%m-%d")
+
+        if command.get("all"):
+            start_text = (today - timedelta(days=365)).strftime("%Y-%m-%d")
+            return start_text, end_text
+        if command.get("from"):
+            return command["from"], end_text
+        return date(today.year, 1, 1).strftime("%Y-%m-%d"), end_text
+
+    def _build_cashflow(self, command: dict) -> dict:
+        if self.cashflow is None:
+            raise ValueError(
+                "收支明细未启用：请在 config.yaml 里配置 cashflow 段并设 enabled: true"
+            )
+        start_text, end_text = self._cashflow_range(command)
+        return self.cashflow.collect(start_text, end_text)
+
+    def cashflow_summary(self, incoming: ChatbotMessage, command: dict):
+        try:
+            result = self._build_cashflow(command)
+        except DingTalkApiError as e:
+            self.logger.error("查询收支失败: %s", e, exc_info=True)
+            self._reply(incoming, "查询失败", f"钉钉接口报错：{e}")
+            return
+        except Exception as e:
+            self.logger.error("查询收支失败: %s", e, exc_info=True)
+            self._reply(incoming, "查询失败", f"查询出错了：{e}")
+            return
+
+        body = format_summary_markdown(
+            result,
+            max_rows=min(self.cfg.max_summary_rows, 24),
+            money_unit=result["money_unit"],
+        )
+        self._reply(incoming, "收支明细汇总", body)
+
+    def cashflow_detail(self, incoming: ChatbotMessage, command: dict):
+        try:
+            result = self._build_cashflow(command)
+        except Exception as e:
+            self.logger.error("查询收支明细失败: %s", e, exc_info=True)
+            self._reply(incoming, "查询失败", f"查询出错了：{e}")
+            return
+
+        body = format_detail_markdown(
+            result["records"],
+            max_rows=self.cfg.max_summary_rows,
+            range_text=result["range_text"],
+            money_unit=result["money_unit"],
+        )
+        if result.get("errors"):
+            body = "⚠ " + "；".join(result["errors"]) + "  \n" + body
+        self._reply(incoming, "收支明细", body)
+
+    def cashflow_export(self, incoming: ChatbotMessage, command: dict):
+        user_id = incoming.sender_staff_id
+        try:
+            result = self._build_cashflow(command)
+        except Exception as e:
+            self.logger.error("导出收支失败: %s", e, exc_info=True)
+            self._reply(incoming, "导出失败", f"读取收支数据失败：{e}")
+            return
+
+        if not result["records"]:
+            self._reply(incoming, "导出",
+                        f"{result['range_text']} 没有已审批完成的收支记录，无需导出。")
+            return
+
+        filename = (f"{self.cashflow.cfg.file_name_prefix}_"
+                    f"{result['start'].replace('-', '')}_"
+                    f"{result['end'].replace('-', '')}.xlsx")
+        payload = build_cashflow_workbook(result, {
+            "range_text": result["range_text"],
+            "money_unit": result["money_unit"],
+            "cache_note": result.get("cache_note"),
+            "exported_at": datetime.now(self.tz).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+        try:
+            self.api.send_file_to_user(
+                user_id, payload, filename,
+                file_type="xlsx", robot_code=self.cfg.robot_code,
+            )
+        except Exception as e:
+            self.logger.error("发送收支表失败 | userId=%s | %s", user_id, e, exc_info=True)
+            self._reply(
+                incoming, "导出失败",
+                f"表格已生成，但发送文件失败：{e}  \n"
+                "如果提示没有有效的单聊会话，请先在钉钉里打开机器人会话发一句话，再重试「导出收支」。",
+            )
+            return
+
+        self.logger.info(
+            "收支表已发送 | userId=%s | 文件=%s | 笔数=%d | %d 字节",
+            user_id, filename, len(result["records"]), len(payload),
+        )
+        self._reply(
+            incoming, "导出完成",
+            f"已把 **{filename}** 私发给你。  \n"
+            f"{result['range_text']}｜{len(result['records'])} 笔"
+            f"（收入 {result['summary']['totals']['income_count']} / "
+            f"支出 {result['summary']['totals']['expense_count']}）。  \n"
             "没收到的话，先在钉钉里和机器人单聊一次再试。",
         )
 

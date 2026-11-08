@@ -13,9 +13,10 @@ from datetime import timedelta, timezone
 import dingtalk_stream
 
 from api import DingTalkApiClient
+from cashflow_service import CashflowService
 from checkin_poller import CheckinPoller
 from config_loader import load_config
-from db import CheckinStore, UserStore
+from db import ApprovalStore, CheckinStore, UserStore
 from handlers import (ApprovalCheckHandler, ApprovalEventRouter,
                       RewardLeaveHandler)
 from logger_setup import setup_logger
@@ -71,6 +72,8 @@ def main():
     checkin_store = None
     user_store = None
     checkin_poller = None
+    approval_store = None
+    cashflow_service = None
 
     if cfg.checkin.enabled or cfg.robot.enabled:
         checkin_store = CheckinStore(cfg.checkin.mongo, logger)
@@ -82,6 +85,21 @@ def main():
         )
     else:
         logger.info("外勤打卡轮询未启用（checkin.enabled = false）")
+
+    # 收支明细：实例缓存 + 取数编排
+    if cfg.cashflow.enabled:
+        approval_store = ApprovalStore(
+            cfg.checkin.mongo, logger, cfg.cashflow.collection
+        )
+        cashflow_service = CashflowService(
+            cfg.cashflow, api, approval_store, user_store, tz, logger
+        )
+        logger.info(
+            "收支明细已启用 | 模板=%d 个 | 缓存集合=%s",
+            len(cfg.cashflow.templates), cfg.cashflow.collection,
+        )
+    else:
+        logger.info("收支明细未启用（cashflow.enabled = false）")
 
     # 注册机器人消息处理器（回调按 topic 挂在 map 里，不会顶掉审批事件处理器）
     if cfg.robot.enabled:
@@ -95,6 +113,7 @@ def main():
                 leave_code=cfg.robot.vacation_leave_code
                 or cfg.approval.reward_leave_code,
                 hours_per_day=cfg.approval.hours_per_day,
+                cashflow=cashflow_service,
             ),
         )
         logger.info(
@@ -135,6 +154,8 @@ def main():
             checkin_poller.stop()
         if approval_check_handler is not None:
             approval_check_handler.shutdown()
+        if approval_store is not None:
+            approval_store.close()
         logger.info("程序已退出")
 
 

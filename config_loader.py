@@ -118,6 +118,30 @@ class ApprovalCheckConfig:
 
 
 @dataclass
+class CashflowTemplateConfig:
+    """一个收支类审批模板（支出申请 / 存入 等）。"""
+    process_code: str
+    label: str = ""            # 展示用类型名，如 支出 / 存入
+    kind: str = "expense"      # expense=支出 income=收入
+    date_field: str = ""       # 日期字段名；留空按第一个 DDDateField
+    amount_field: str = ""     # 金额字段名；留空按第一个 NumberField
+    reason_field: str = ""     # 事由字段名；留空按第一个 TextField
+
+
+@dataclass
+class CashflowConfig:
+    """收入支出明细汇总（机器人指令）。"""
+    enabled: bool = False
+    templates: List[CashflowTemplateConfig] = field(default_factory=list)
+    collection: str = "approval_instances"   # 实例缓存的 Mongo 集合名
+    cache_ttl_days: int = 30        # 已缓存实例多久后重新拉一次详情
+    max_fetch_per_query: int = 200  # 单次最多补拉多少条详情（首次建议分批）
+    max_rows: int = 30              # 聊天里最多展示多少行
+    money_unit: str = "元"
+    file_name_prefix: str = "收支明细"
+
+
+@dataclass
 class AppConfig:
     dingtalk: DingTalkConfig
     approval: ApprovalConfig
@@ -126,6 +150,7 @@ class AppConfig:
     checkin: CheckinConfig = field(default_factory=CheckinConfig)
     robot: RobotConfig = field(default_factory=RobotConfig)
     approval_check: ApprovalCheckConfig = field(default_factory=ApprovalCheckConfig)
+    cashflow: CashflowConfig = field(default_factory=CashflowConfig)
 
 
 def _build_robot_config(raw: dict) -> RobotConfig:
@@ -334,6 +359,58 @@ def _build_approval_check_config(raw: dict) -> ApprovalCheckConfig:
     return cfg
 
 
+def _build_cashflow_config(raw: dict) -> CashflowConfig:
+    cf = raw.get("cashflow") or {}
+
+    templates: List[CashflowTemplateConfig] = []
+    for item in cf.get("templates") or []:
+        code = str(item.get("process_code", "")).strip()
+        if not code:
+            raise ValueError("cashflow.templates[].process_code 未配置")
+        kind = str(item.get("kind", "expense")).strip().lower()
+        if kind not in ("expense", "income"):
+            raise ValueError(
+                f"cashflow.templates[{code}].kind 只能是 expense 或 income，当前为 {kind!r}"
+            )
+        templates.append(CashflowTemplateConfig(
+            process_code=code,
+            label=(str(item.get("label", "")).strip()
+                   or ("支出" if kind == "expense" else "存入")),
+            kind=kind,
+            date_field=str(item.get("date_field", "")).strip(),
+            amount_field=str(item.get("amount_field", "")).strip(),
+            reason_field=str(item.get("reason_field", "")).strip(),
+        ))
+
+    cfg = CashflowConfig(
+        enabled=bool(cf.get("enabled", False)),
+        templates=templates,
+        collection=(str(cf.get("collection", "approval_instances")).strip()
+                    or "approval_instances"),
+        cache_ttl_days=int(cf.get("cache_ttl_days", 30)),
+        max_fetch_per_query=int(cf.get("max_fetch_per_query", 200)),
+        max_rows=int(cf.get("max_rows", 30)),
+        money_unit=str(cf.get("money_unit", "元")).strip() or "元",
+        file_name_prefix=(str(cf.get("file_name_prefix", "收支明细")).strip()
+                          or "收支明细"),
+    )
+
+    if cfg.enabled:
+        if not cfg.templates:
+            raise ValueError("cashflow.templates 未配置")
+        codes = [t.process_code for t in cfg.templates]
+        if len(codes) != len(set(codes)):
+            raise ValueError("cashflow.templates 里的 process_code 有重复")
+        if cfg.cache_ttl_days < 0:
+            raise ValueError("cashflow.cache_ttl_days 不能为负")
+        if cfg.max_fetch_per_query < 1:
+            raise ValueError("cashflow.max_fetch_per_query 必须大于 0")
+        if cfg.max_rows < 1:
+            raise ValueError("cashflow.max_rows 必须大于 0")
+
+    return cfg
+
+
 def load_config(path: str = "config.yaml") -> AppConfig:
     if not os.path.exists(path):
         raise FileNotFoundError(f"配置文件不存在: {path}")
@@ -382,6 +459,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     checkin_cfg = _build_checkin_config(raw)
     robot_cfg = _build_robot_config(raw)
     approval_check_cfg = _build_approval_check_config(raw)
+    cashflow_cfg = _build_cashflow_config(raw)
 
     return AppConfig(
         dingtalk=DingTalkConfig(client_id, client_secret),
@@ -391,4 +469,5 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         checkin=checkin_cfg,
         robot=robot_cfg,
         approval_check=approval_check_cfg,
+        cashflow=cashflow_cfg,
     )

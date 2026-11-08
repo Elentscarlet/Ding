@@ -492,6 +492,86 @@ class DingTalkApiClient:
         )
 
     # ------------------------------------------------------------------
+    # 审批：实例 ID 列表 / 用户姓名
+    # ------------------------------------------------------------------
+    # 实例列表接口的硬限制（见官方文档）
+    MAX_INSTANCE_PAGE = 20            # maxResults 上限
+    MAX_INSTANCE_WINDOW_DAYS = 120    # 单次查询跨度上限
+    MAX_INSTANCE_LOOKBACK_DAYS = 365  # startTime 距当前时间上限（普通版）
+
+    def list_process_instance_ids(self, process_code: str,
+                                  start_ms: int, end_ms: int,
+                                  statuses=None, max_pages: int = 100) -> list:
+        """获取审批实例 ID 列表（自动按 120 天切片 + 翻页）。
+
+        :param statuses: 例如 ["COMPLETED"]；只查已完成的可以省掉大量详情调用
+        """
+        url = f"{self.API_BASE}/v1.0/workflow/processes/instanceIds/query"
+        window = self.MAX_INSTANCE_WINDOW_DAYS * 24 * 3600 * 1000
+        ids: list = []
+        cursor = int(start_ms)
+        end_ms = int(end_ms)
+
+        while cursor < end_ms:
+            chunk_end = min(cursor + window, end_ms)
+            ids.extend(self._list_instance_ids_in_window(
+                url, process_code, cursor, chunk_end, statuses, max_pages,
+            ))
+            cursor = chunk_end
+
+        # 分页边界偶尔会重复返回同一个 id，去重且保序
+        return list(dict.fromkeys(ids))
+
+    def _list_instance_ids_in_window(self, url, process_code, start_ms, end_ms,
+                                     statuses, max_pages):
+        token = 0
+        collected: list = []
+
+        for _ in range(max_pages):
+            body = {
+                "processCode": process_code,
+                "startTime": int(start_ms),
+                "endTime": int(end_ms),
+                "nextToken": token,
+                "maxResults": self.MAX_INSTANCE_PAGE,
+            }
+            if statuses:
+                body["statuses"] = list(statuses)
+
+            data = self._call(
+                "POST", url,
+                idempotent=True,
+                describe=f"获取审批实例ID({process_code[-6:]})",
+                headers={"x-acs-dingtalk-access-token": self.get_access_token()},
+                json=body,
+            )
+            result = data.get("result") or {}
+            page = result.get("list") or []
+            collected.extend(page)
+
+            next_token = result.get("nextToken")
+            if not page or next_token in (None, "", 0, "0"):
+                break
+            try:
+                token = int(next_token)
+            except (TypeError, ValueError):
+                break
+
+        return collected
+
+    def get_user_name(self, user_id: str) -> str:
+        """查用户姓名（用于审批明细里展示发起人）。"""
+        url = f"{self.OAPI_BASE}/topapi/v2/user/get"
+        data = self._call(
+            "POST", url,
+            idempotent=True,
+            describe=f"获取用户详情({user_id})",
+            params={"access_token": self.get_access_token()},
+            json={"userid": user_id, "language": "zh_CN"},
+        )
+        return ((data.get("result") or {}).get("name") or "").strip()
+
+    # ------------------------------------------------------------------
     # 机器人：媒体上传与文件消息
     # ------------------------------------------------------------------
     def upload_media(self, content: bytes, filename: str,
