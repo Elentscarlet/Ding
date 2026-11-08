@@ -123,9 +123,9 @@ class CashflowTemplateConfig:
     process_code: str
     label: str = ""            # 展示用类型名，如 支出 / 存入
     kind: str = "expense"      # expense=支出 income=收入
-    date_field: str = ""       # 日期字段名；留空按第一个 DDDateField
     amount_field: str = ""     # 金额字段名；留空按第一个 NumberField
     reason_field: str = ""     # 事由字段名；留空按第一个 TextField
+    # 日期不单独配置：一律取审批日期（审批完成时间，退回发起时间）
 
 
 @dataclass
@@ -139,6 +139,9 @@ class CashflowConfig:
     max_rows: int = 30              # 聊天里最多展示多少行
     money_unit: str = "元"
     file_name_prefix: str = "收支明细"
+    # 实例列表按「发起时间」查，而报表按「审批日期」汇总，
+    # 所以扫描起点要比报表起点再往前放几天，避免"上月底提交、本月初审批"的单子漏掉
+    scan_margin_days: int = 30
 
 
 @dataclass
@@ -377,7 +380,6 @@ def _build_cashflow_config(raw: dict) -> CashflowConfig:
             label=(str(item.get("label", "")).strip()
                    or ("支出" if kind == "expense" else "存入")),
             kind=kind,
-            date_field=str(item.get("date_field", "")).strip(),
             amount_field=str(item.get("amount_field", "")).strip(),
             reason_field=str(item.get("reason_field", "")).strip(),
         ))
@@ -393,6 +395,7 @@ def _build_cashflow_config(raw: dict) -> CashflowConfig:
         money_unit=str(cf.get("money_unit", "元")).strip() or "元",
         file_name_prefix=(str(cf.get("file_name_prefix", "收支明细")).strip()
                           or "收支明细"),
+        scan_margin_days=int(cf.get("scan_margin_days", 30)),
     )
 
     if cfg.enabled:
@@ -407,6 +410,8 @@ def _build_cashflow_config(raw: dict) -> CashflowConfig:
             raise ValueError("cashflow.max_fetch_per_query 必须大于 0")
         if cfg.max_rows < 1:
             raise ValueError("cashflow.max_rows 必须大于 0")
+        if cfg.scan_margin_days < 0:
+            raise ValueError("cashflow.scan_margin_days 不能为负")
 
     return cfg
 

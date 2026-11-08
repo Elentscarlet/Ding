@@ -4,9 +4,10 @@
 收入支出明细：字段解析、按汇总、聊天展示、Excel 导出。
 
 两个审批模板（支出申请 / 存入）的实例详情结构一样，只是字段名不同，
-所以字段名走配置（cashflow.templates[].date_field / amount_field / reason_field），
-留空则按组件类型兜底（第一个 DDDateField / NumberField / TextField）。
+所以字段名走配置（cashflow.templates[].amount_field / reason_field），
+留空则按组件类型兜底（第一个 NumberField / TextField）。
 
+日期一律取**审批日期**（审批完成时间，退回发起时间），不读表单里的日期字段。
 金额内部按 float 元存储；展示保留两位小数。
 """
 
@@ -26,9 +27,14 @@ DATE_FORMATS = (
 )
 
 SUMMARY_HEADERS = ["月份", "收入", "支出", "结余"]
-DETAIL_HEADERS = ["日期", "类型", "金额", "事由", "发起人"]
-EXCEL_DETAIL_HEADERS = ["日期", "类型", "金额", "事由", "发起人",
+DETAIL_HEADERS = ["审批日期", "类型", "金额", "事由", "发起人"]
+EXCEL_DETAIL_HEADERS = ["审批日期", "类型", "金额", "事由", "发起人",
                         "审批单号", "标题", "状态"]
+
+# 解析口径版本：字段含义变了就 +1，缓存里旧版本的行会被自动重拉
+#   1 = 业务日期取表单里的开支日期
+#   2 = 业务日期一律取审批日期（不再读表单日期）
+PARSER_VERSION = 2
 
 
 # ======================================================================
@@ -89,15 +95,6 @@ def parse_biz_date(value, tz: timezone) -> Optional[str]:
     return None
 
 
-def ms_to_date(milliseconds, tz: timezone) -> Optional[str]:
-    if milliseconds in (None, ""):
-        return None
-    try:
-        return datetime.fromtimestamp(int(milliseconds) / 1000, tz).strftime("%Y-%m-%d")
-    except (TypeError, ValueError, OverflowError, OSError):
-        return None
-
-
 def pick_component(components: Sequence[dict], name: str, component_type: str):
     """按字段名找组件；找不到再按组件类型兜底。"""
     comps = [c for c in (components or []) if isinstance(c, dict)]
@@ -114,22 +111,37 @@ def pick_component(components: Sequence[dict], name: str, component_type: str):
     return None
 
 
+def approval_date(detail: dict, tz: timezone):
+    """审批日期：优先审批完成时间，没有就退回发起时间。
+
+    注意：详情接口返回的 createTime / finishTime 是 **ISO 字符串**
+    （例如 "2026-11-08T12:36Z"，UTC），不是毫秒时间戳。
+
+    :return: ("YYYY-MM-DD" 或 None, "finish"/"create"/"")
+    """
+    finish = parse_biz_date(detail.get("finishTime"), tz)
+    if finish:
+        return finish, "finish"
+    create = parse_biz_date(detail.get("createTime"), tz)
+    if create:
+        return create, "create"
+    return None, ""
+
+
 def extract_instance(template, detail: dict, instance_id: str,
                      tz: timezone) -> dict:
     """把一单审批实例解析成缓存记录。
+
+    日期口径：**一律以审批日期为准**（不再读表单里的开支日期/存入日期）。
 
     :param template: AppConfig.cashflow.templates 里的一个模板配置
     """
     components = detail.get("formComponentValues") or []
 
-    date_comp = pick_component(components, template.date_field, "DDDateField")
     amount_comp = pick_component(components, template.amount_field, "NumberField")
     reason_comp = pick_component(components, template.reason_field, "TextField")
 
-    biz_date = parse_biz_date(date_comp.get("value") if date_comp else None, tz)
-    create_date = ms_to_date(detail.get("createTime"), tz)
-    # 表单没填日期就退回发起日期，避免这笔记录在区间查询里丢失
-    used_date = biz_date or create_date
+    biz_date, date_source = approval_date(detail, tz)
 
     amount = parse_amount(amount_comp.get("value") if amount_comp else None)
     reason = (reason_comp.get("value") if reason_comp else "") or ""
@@ -139,9 +151,11 @@ def extract_instance(template, detail: dict, instance_id: str,
         "process_code": template.process_code,
         "kind": template.kind,
         "label": template.label,
-        "biz_date": used_date or "",
-        "biz_date_from_form": bool(biz_date),
-        "create_date": create_date or "",
+        "schema_version": PARSER_VERSION,
+        "biz_date": biz_date or "",
+        "date_source": date_source,
+        "create_date": parse_biz_date(detail.get("createTime"), tz) or "",
+        "finish_date": parse_biz_date(detail.get("finishTime"), tz) or "",
         "amount": amount if amount is not None else 0.0,
         "amount_missing": amount is None,
         "reason": str(reason).strip(),
@@ -149,7 +163,6 @@ def extract_instance(template, detail: dict, instance_id: str,
         "title": detail.get("title") or "",
         "status": (detail.get("status") or "").upper(),
         "result": (detail.get("result") or "").lower(),
-        "finish_time": detail.get("finishTime"),
         "form": {
             (comp.get("name") or comp.get("id") or ""): comp.get("value")
             for comp in components if isinstance(comp, dict)

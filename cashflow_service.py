@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from api import DingTalkApiClient, DingTalkApiError
-from cashflow_report import aggregate, extract_instance
+from cashflow_report import PARSER_VERSION, aggregate, extract_instance
 
 # 实例列表接口限制：startTime 距今最多 365 天（普通版）
 MAX_LOOKBACK_DAYS = 365
@@ -88,7 +88,16 @@ class CashflowService:
 
         start_text = start_dt.strftime("%Y-%m-%d")
         end_text = end_dt.strftime("%Y-%m-%d")
-        start_ms = int(start_dt.timestamp() * 1000)
+
+        # 报表按「审批日期」过滤，但实例列表只能按「发起时间」查，
+        # 所以扫描起点要往前放 scan_margin_days，否则"上月底提交、本月初审批"的单子会被漏掉
+        scan_start_dt = start_dt - timedelta(
+            days=max(0, int(self.cfg.scan_margin_days))
+        )
+        if scan_start_dt < earliest:
+            scan_start_dt = earliest
+        scan_start_text = scan_start_dt.strftime("%Y-%m-%d")
+        start_ms = int(scan_start_dt.timestamp() * 1000)
         end_ms = int(end_dt.timestamp() * 1000)
 
         fetched_records: List[dict] = []
@@ -119,8 +128,10 @@ class CashflowService:
                 current_ids[instance_id] = template.kind
 
             self.logger.info(
-                "收支：%s 模板共 %d 个已完成实例 | %s ~ %s",
-                template.label, len(ids), start_text, end_text,
+                "收支：%s 模板共 %d 个已完成实例 | 发起时间 %s ~ %s"
+                "（报表按审批日期 %s ~ %s 过滤）",
+                template.label, len(ids), scan_start_text, end_text,
+                start_text, end_text,
             )
 
             cached = self._get_cached(ids)
@@ -201,6 +212,9 @@ class CashflowService:
 
     @staticmethod
     def _is_fresh(doc: dict, stale_before: datetime) -> bool:
+        # 解析口径变了（字段含义/取数逻辑调整）就当作过期，重新拉一次详情
+        if doc.get("schema_version") != PARSER_VERSION:
+            return False
         fetched_at = doc.get("fetched_at")
         if not isinstance(fetched_at, datetime):
             return False

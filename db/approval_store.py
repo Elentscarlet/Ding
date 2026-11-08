@@ -51,7 +51,7 @@ class ApprovalStore(_MongoBase):
             cursor = self._ensure_collection().find(
                 {"instance_id": {"$in": ids}},
                 {"instance_id": 1, "status": 1, "result": 1, "fetched_at": 1,
-                 "biz_date": 1, "amount": 1},
+                 "biz_date": 1, "amount": 1, "schema_version": 1},
             )
             return {doc["instance_id"]: doc for doc in cursor}
         except PyMongoError as e:
