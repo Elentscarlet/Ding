@@ -277,7 +277,7 @@ class CheckinRobotHandler(AsyncChatbotHandler):
             self.balance(incoming, command)
         elif action == "balance_export":
             self.balance_export(incoming, command)
-        elif action == "cashflow":
+        elif action in ("cashflow", "cashflow_summary"):
             self.cashflow_summary(incoming, command)
         elif action == "cashflow_detail":
             self.cashflow_detail(incoming, command)
