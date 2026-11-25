@@ -1,0 +1,144 @@
+# 配置示例：复制为 config.yaml 后填入自己的值（config.yaml 已被 .gitignore 忽略）
+#
+# 凭证也可以不写进文件，用环境变量覆盖（优先级高于本文件）：
+#   DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET / MONGODB_URI
+#
+# 真实的企业 Client Secret、审批模板 processCode、员工 userId、打卡地点坐标
+# 都属于内部信息，不要提交到公开仓库。
+
+dingtalk:
+  # 钉钉开放平台 -> 企业自建应用 -> 应用详情
+  client_id: "your_client_id"
+  client_secret: "your_client_secret"
+
+# OA 审批配置
+approval:
+  # 奖励假期审批模板的 processCode（在钉钉审批模板详情页获取）
+  reward_leave_process_code: "PROC-11111111-1111-1111-1111-111111111111"
+  # 奖励假期对应的钉钉假期类型 leave_code（通过「查询假期规则列表」接口获取）
+  reward_leave_code: "your-leave-code"
+  # 拥有 OA 审批应用权限的管理员 userId（调用审批详情 API 需要）
+  admin_user_id: "your_admin_user_id"
+  # 一天折算多少小时：奖励假期按小时计价，发放和余额展示都用这个系数
+  hours_per_day: 6.0
+
+logging:
+  level: "INFO"
+  file: "logs/event_subscriber.log"
+
+connection:
+  max_consecutive_failures: 5
+  reconnect_backoff: [2, 5, 10, 30, 60]
+
+# 外勤打卡轮询配置
+checkin:
+  enabled: true               # 关掉则完全不启动轮询任务
+  poll_interval: 60000        # 轮询间隔（秒），不建议小于 30
+  lookback_days: 1            # 每次回看天数，接口上限 7 天（重叠部分靠去重兜底）
+  utc_offset_hours: 8         # 时段判定所用时区，东八区填 8
+  user_cache_ttl: 1800        # 部门员工列表缓存时长（秒）
+  include_sub_departments: true   # 是否递归包含子部门（需要「通讯录部门信息读权限」）
+  department_ids: [1]         # 要轮询的部门 deptId，根部门传 1
+
+  # 判定口径
+  require_outside: true           # 仅记录外勤打卡（locationResult=Outside）
+  exclude_invalid_records: false  # 是否排除需二次确认等异常打卡
+
+  # 外勤地点规则：坐标 + 半径（米） + 生效时段；命中任意一条即记录一条
+  # 时段支持跨夜写法，例如 "22:00-06:00"
+  places:
+    - name: "示例地点（上午）"
+      longitude: 120.000000
+      latitude: 30.000000
+      radius: 500
+      time_range: "7:50-8:30"
+    - name: "示例地点（下午）"
+      longitude: 120.000000
+      latitude: 30.000000
+      radius: 500
+      time_range: "15:55-16:05"
+
+  # MongoDB：连接串也可用环境变量 MONGODB_URI 覆盖
+  mongo:
+    uri: "mongodb://127.0.0.1:27017"
+    database: "dingtalk"
+    collection: "checkin_records"
+    users_collection: "users"      # 员工姓名缓存（机器人展示"到岗人"用）
+    server_selection_timeout_ms: 3000
+
+# 外勤打卡查询机器人
+# 用法：在钉钉里直接和机器人单聊，或在群里 @机器人，例如
+#   查询 2026-10-13
+#   查询 2026-10-13 2026-10-14 示例地点
+#   导出 昨天
+#   地点 / 帮助
+robot:
+  enabled: true
+  # 允许使用机器人的白名单 userId（不在名单里的人，机器人一律不响应）
+  admin_user_ids:
+    - "your_user_id"
+  # 机器人 robotCode；留空则用 dingtalk.client_id（企业内部应用机器人通常就是它）
+  robot_code: ""
+  default_range_days: 7        # 不写日期时默认查最近几天
+  max_summary_rows: 30         # 聊天里最多展示多少条（地点/日期），超出会提示用导出
+  export_limit: 20000          # 单次导出上限行数
+  file_name_prefix: "外勤打卡记录"
+
+# 审批提交校验：另一个模板，员工提交时校验表单，不通过直接驳回
+approval_check:
+  enabled: true
+  # 要校验的审批模板 processCode
+  process_code: "PROC-22222222-2222-2222-2222-222222222222"
+  # 驳回操作人：默认就用「当前待办任务的审批人」(tasks[].userId)，这里只是兜底。
+  # 只有在任务里取不到 userId 时才会用到，因此可以留空。
+  actioner_user_id: ""
+  remark_prefix: "系统校验未通过："
+  task_wait_retries: 5          # 事件可能比审批任务先到，拉不到待办任务时重试几次
+  task_wait_interval: 1.0       # 每次重试间隔（秒）
+  # 表单里找不到规则里的字段时怎么办：
+  #   skip   = 跳过该条规则并告警（默认，防止字段名写错把所有单子都驳回）
+  #   reject = 按未通过处理
+  on_missing_field: "skip"
+  # 观察开关：true = 只把"本应驳回"的记录写进日志，不真的驳回。
+  # 新规则上线建议先开 true 跑一两天，确认不会误伤正常单子再改回 false。
+  dry_run: false
+
+  # 校验规则：field 可写表单组件的 名称 name / 组件ID id / 别名 bizAlias / 组件类型 componentType
+  rules:
+    # 请假时长篡改校验：组件 extValue 里的 originDurationInHour 与 customDuration 必须一致。
+    # 组件 id 带随机后缀，万一变了，把 field 改成 componentType（DDHolidayField）也能命中。
+    - field: "DDHolidayField-XXXXXXXX"
+      type: ext_value_compare
+      left_key: "originDurationInHour"
+      right_key: "customDuration"
+      op: eq
+      message: "请假时长不正确."
+
+# 收支明细：把「支出申请」「存入」两类审批里已完成的实例汇总
+cashflow:
+  enabled: true
+  # 本地缓存（Mongo）集合名：拉过的实例详情存这里，下次只补新的
+  collection: "approval_instances"
+  cache_ttl_days: 30            # 缓存超过多少天后重新拉一次详情
+  max_fetch_per_query: 200      # 单次查询最多补拉多少条详情（首次会自动分批）
+  max_rows: 30                  # 聊天里最多展示多少行
+  money_unit: "元"
+  file_name_prefix: "收支明细"
+  # 实例列表只能按「发起时间」查，报表按「审批日期」汇总：
+  # 扫描起点往前多放几天，避免"上月底提交、本月初审批"的单子被漏掉
+  scan_margin_days: 30
+
+  # 两个模板：kind=expense 记为支出，kind=income 记为收入
+  # 日期不再配置：一律取审批日期（审批完成时间，退回发起时间）
+  # 金额/事由字段名留空则按组件类型兜底（第一个 NumberField / TextField）
+  templates:
+    - process_code: "PROC-33333333-3333-3333-3333-333333333333"
+      label: "支出"
+      kind: "expense"
+      amount_field: "支出金额"
+      reason_field: "事由"
+    - process_code: "PROC-44444444-4444-4444-4444-444444444444"
+      label: "存入"
+      kind: "income"
+      amount_field: "存入金额"
+      reason_field: "事由"
