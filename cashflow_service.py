@@ -11,6 +11,8 @@
      cache_ttl_days）就不再调「实例详情」，只补缺失的/过期的。
   3. 汇总时按「接口返回的 ID 集合」从缓存里取记录，再按业务日期过滤；
      详情接口若报"实例不存在"（已被删除），把它从缓存里删掉并排除出结果。
+  4. 汇总前按 bizAction 去重：修改（MODIFY）只计修正后的版本，撤销（REVOKE）
+     整单不计入，避免同一张审批单被重复计账。
 
 缓存放 Mongo（ApprovalStore）；Mongo 不可用时退化为"只查不缓存"，
 本次结果照常返回，只是在回复里注明。
@@ -21,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from api import DingTalkApiClient, DingTalkApiError
-from cashflow_report import PARSER_VERSION, aggregate, extract_instance
+from cashflow_report import PARSER_VERSION, aggregate, dedupe_versions, extract_instance
 
 # 实例列表接口限制：startTime 距今最多 365 天（普通版）
 MAX_LOOKBACK_DAYS = 365
@@ -162,6 +164,9 @@ class CashflowService:
         records = self._load_records(
             current_ids.keys(), start_text, end_text, fallback=fetched_records,
         )
+        # 修正（MODIFY）/撤销（REVOKE）单在钉钉里是原单的附属实例，
+        # 原单与附属单都会被实例 ID 列表返回，汇总前必须按逻辑审批单去重。
+        records, version_stats = dedupe_versions(records)
         self._resolve_names(records)
 
         summary = aggregate(records)
@@ -176,6 +181,12 @@ class CashflowService:
             cache_note += f"（{len(missing_ids)} 个实例已不存在，已剔除）"
 
         # 缓存命中情况要能从日志里回溯（回复里的 cache_note 去掉 markdown 标记）
+        if version_stats["corrected"] or version_stats["revoked"]:
+            self.logger.info(
+                "收支：按 bizAction 去重 | 修正 %d 单（按修正后金额计）| "
+                "撤销 %d 单（整单未计入）",
+                version_stats["corrected"], version_stats["revoked"],
+            )
         self.logger.info(
             "收支查询完成 | 区间=%s ~ %s | 接口实例ID=%d 个 | 记录=%d 条 | %s",
             start_text, end_text, len(current_ids), len(records),

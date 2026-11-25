@@ -34,7 +34,8 @@ EXCEL_DETAIL_HEADERS = ["审批日期", "类型", "金额", "事由", "发起人
 # 解析口径版本：字段含义变了就 +1，缓存里旧版本的行会被自动重拉
 #   1 = 业务日期取表单里的开支日期
 #   2 = 业务日期一律取审批日期（不再读表单日期）
-PARSER_VERSION = 2
+#   3 = 记录 biz_action / main_instance_id，用于修正、撤销单去重
+PARSER_VERSION = 3
 
 
 # ======================================================================
@@ -163,6 +164,13 @@ def extract_instance(template, detail: dict, instance_id: str,
         "title": detail.get("title") or "",
         "status": (detail.get("status") or "").upper(),
         "result": (detail.get("result") or "").lower(),
+        # 修改/撤销已通过的审批单时，钉钉会生成附属实例：
+        #   biz_action: NONE 正常发起 / MODIFY 基于原单修改 / REVOKE 原单撤销后重新发起
+        #   main_instance_id: 原单（逻辑审批单）的实例 ID
+        "biz_action": (detail.get("bizAction") or "NONE").strip().upper(),
+        "main_instance_id": detail.get("mainProcessInstanceId") or "",
+        "business_id": detail.get("businessId") or "",
+        "attached_instance_ids": list(detail.get("attachedProcessInstanceIds") or []),
         "form": {
             (comp.get("name") or comp.get("id") or ""): comp.get("value")
             for comp in components if isinstance(comp, dict)
@@ -174,6 +182,94 @@ def extract_instance(template, detail: dict, instance_id: str,
 def is_approved(record: dict) -> bool:
     """只有「审批完成 + 同意」的才算进账。"""
     return record.get("status") == "COMPLETED" and record.get("result") == "agree"
+
+
+def _version_key(record: dict):
+    """同一张逻辑审批单里，判断哪个版本更新。
+
+    优先按业务日期，其次让 MODIFY 压过 NONE（同一天修改时以修正版为准），
+    最后用拉取时间兜底。
+    """
+    date = record.get("finish_date") or record.get("create_date") or ""
+    priority = 1 if (record.get("biz_action") or "NONE") == "MODIFY" else 0
+    fetched = record.get("fetched_at")
+    try:
+        fetched_ts = float(fetched.timestamp())
+    except (AttributeError, TypeError, ValueError, OSError):
+        fetched_ts = 0.0
+    return (date, priority, fetched_ts)
+
+
+def dedupe_versions(records: Sequence[dict]):
+    """按「逻辑审批单」去重：修正保留最新版，撤销整单剔除。
+
+    修改/撤销**已通过**的审批单时，钉钉不改原实例，而是生成一个附属实例，
+    新实例的 bizAction 标出动作、mainProcessInstanceId 指回原实例。原实例和
+    附属实例都会出现在「审批实例 ID 列表」里，直接汇总就会重复计账：
+
+      - bizAction=MODIFY：只保留修正后的那一单，原单不再计入；
+      - bizAction=REVOKE：原单已被撤销，整组都不计入（撤销动作本身不是收支）。
+
+    分组用并查集：mainProcessInstanceId 指回原单，businessId 在附属单上沿用原单，
+    两个线索任意一个对上就归为同一张逻辑审批单（个别返回缺字段时也能兜住）。
+
+    局限：分组只看"本次查询取到的记录"。若修正单的审批日期落在查询区间之外，
+    本次仍按原单汇总；等查到修正单所在区间时，再按修正后的金额计一次。
+
+    :return: (保留的记录, {"corrected": 修正单数, "revoked": 撤销单数})
+    """
+    items = list(records)
+    parent: dict = {}
+
+    def find(node):
+        parent.setdefault(node, node)
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    def union(left, right):
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    business_first: dict = {}
+    for record in items:
+        instance_id = record.get("instance_id") or ""
+        if not instance_id:
+            continue
+        find(instance_id)
+        main_id = record.get("main_instance_id")
+        if main_id:
+            union(instance_id, main_id)
+        business_id = record.get("business_id")
+        if business_id:
+            if business_id in business_first:
+                union(instance_id, business_first[business_id])
+            else:
+                business_first[business_id] = instance_id
+
+    groups: dict = {}
+    for record in items:
+        instance_id = record.get("instance_id") or ""
+        key = find(instance_id) if instance_id else ""
+        groups.setdefault(key, []).append(record)
+
+    kept: List[dict] = []
+    corrected = 0
+    revoked = 0
+    for group in groups.values():
+        if any((r.get("biz_action") or "NONE") == "REVOKE" for r in group):
+            revoked += 1
+            continue
+        effective = max(group, key=_version_key)
+        if (effective.get("biz_action") or "NONE") == "MODIFY":
+            corrected += 1
+        kept.append(effective)
+
+    return kept, {"corrected": corrected, "revoked": revoked}
 
 
 # ======================================================================

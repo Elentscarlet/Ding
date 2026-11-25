@@ -16,7 +16,7 @@ from api import DingTalkApiClient
 from cashflow_service import CashflowService
 from checkin_poller import CheckinPoller
 from config_loader import load_config
-from db import ApprovalStore, CheckinStore, UserStore
+from db import ApprovalStore, CheckinStore, RewardGrantStore, UserStore
 from handlers import (ApprovalCheckHandler, ApprovalEventRouter,
                       RewardLeaveHandler)
 from logger_setup import setup_logger
@@ -54,7 +54,13 @@ def main():
     #    所以要占住这个槽位后按 processCode 自己分发，否则后注册的会顶掉前面的。
     tz = timezone(timedelta(hours=cfg.checkin.utc_offset_hours))
 
-    approval_handlers = [RewardLeaveHandler(cfg.approval, api, logger)]
+    # 奖励假期发放台账：修正按差额、撤销按原额都要靠它记着"当初发了多少"，
+    # 同时用于钉钉重复投递事件时的幂等（Mongo 不可用时自动退化为回查原实例）。
+    reward_grant_store = RewardGrantStore(cfg.checkin.mongo, logger)
+
+    approval_handlers = [RewardLeaveHandler(
+        cfg.approval, api, logger, grant_store=reward_grant_store
+    )]
     approval_check_handler = None
     if cfg.approval_check.enabled:
         approval_check_handler = ApprovalCheckHandler(
@@ -156,6 +162,8 @@ def main():
             approval_check_handler.shutdown()
         if approval_store is not None:
             approval_store.close()
+        if reward_grant_store is not None:
+            reward_grant_store.close()
         logger.info("程序已退出")
 
 
