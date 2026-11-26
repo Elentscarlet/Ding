@@ -145,6 +145,16 @@ class CashflowConfig:
 
 
 @dataclass
+class ScheduleConfig:
+    """排班表导出配置。"""
+    enabled: bool = True
+    default_days: int = 7            # 不写日期时默认导出最近几天
+    max_days: int = 31               # 单次最多导出天数（接口按天查，天数越多调用越多）
+    page_size: int = 200             # 分页大小，接口上限 200
+    file_name_prefix: str = "排班表"
+
+
+@dataclass
 class AppConfig:
     dingtalk: DingTalkConfig
     approval: ApprovalConfig
@@ -154,6 +164,28 @@ class AppConfig:
     robot: RobotConfig = field(default_factory=RobotConfig)
     approval_check: ApprovalCheckConfig = field(default_factory=ApprovalCheckConfig)
     cashflow: CashflowConfig = field(default_factory=CashflowConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+
+
+def _build_schedule_config(raw: dict) -> ScheduleConfig:
+    sc = raw.get("schedule") or {}
+    cfg = ScheduleConfig(
+        enabled=bool(sc.get("enabled", True)),
+        default_days=int(sc.get("default_days", 7)),
+        max_days=int(sc.get("max_days", 31)),
+        page_size=int(sc.get("page_size", 200)),
+        file_name_prefix=str(sc.get("file_name_prefix", "排班表")).strip() or "排班表",
+    )
+
+    if cfg.default_days < 1:
+        raise ValueError("schedule.default_days 必须大于 0")
+    if cfg.max_days < 1:
+        raise ValueError("schedule.max_days 必须大于 0")
+    if cfg.default_days > cfg.max_days:
+        raise ValueError("schedule.default_days 不能大于 schedule.max_days")
+    if not (1 <= cfg.page_size <= 200):
+        raise ValueError("schedule.page_size 取值 1~200（接口 size 上限 200）")
+    return cfg
 
 
 def _build_robot_config(raw: dict) -> RobotConfig:
@@ -465,6 +497,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     robot_cfg = _build_robot_config(raw)
     approval_check_cfg = _build_approval_check_config(raw)
     cashflow_cfg = _build_cashflow_config(raw)
+    schedule_cfg = _build_schedule_config(raw)
 
     return AppConfig(
         dingtalk=DingTalkConfig(client_id, client_secret),
@@ -475,4 +508,5 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         robot=robot_cfg,
         approval_check=approval_check_cfg,
         cashflow=cashflow_cfg,
+        schedule=schedule_cfg,
     )

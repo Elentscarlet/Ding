@@ -461,6 +461,65 @@ class DingTalkApiClient:
         return data.get("recordresult") or []
 
     # ------------------------------------------------------------------
+    # 考勤：排班（按天查全公司）
+    # ------------------------------------------------------------------
+    MAX_SCHEDULE_PAGE_SIZE = 200      # 接口 size 上限
+
+    def list_schedule_by_day(self, work_date: str, offset: int = 0,
+                             size: int = MAX_SCHEDULE_PAGE_SIZE) -> dict:
+        """查询企业某一天的排班详情（全公司）。
+
+        对应「查询企业考勤排班详情」/topapi/attendance/listschedule。
+        注意：固定班制只能查到未来 15 天；仅支持企业总人数 10000 以下。
+
+        :param work_date: "YYYY-MM-DD"（接口只取年月日部分）
+        :return: {"schedules": [...], "has_more": bool}
+        """
+        url = f"{self.OAPI_BASE}/topapi/attendance/listschedule"
+        page_size = max(1, min(int(size), self.MAX_SCHEDULE_PAGE_SIZE))
+
+        data = self._call(
+            "POST", url,
+            idempotent=True,
+            describe=f"查询排班详情({work_date}, offset={offset})",
+            params={"access_token": self.get_access_token()},
+            json={
+                "workDate": work_date,
+                "offset": int(offset),
+                "size": page_size,
+            },
+        )
+        result = data.get("result") or {}
+        return {
+            "schedules": result.get("schedules") or [],
+            "has_more": _as_bool(result.get("has_more")),
+        }
+
+    def list_schedule_all(self, work_date: str,
+                          page_size: int = MAX_SCHEDULE_PAGE_SIZE,
+                          max_pages: int = 100) -> list:
+        """拉取某一天的**全部**排班（自动翻页），返回 schedules 列表。"""
+        offset = 0
+        rows: list = []
+        for page_index in range(1, max_pages + 1):
+            page = self.list_schedule_by_day(work_date, offset, page_size)
+            batch = page["schedules"]
+            rows.extend(batch)
+            if not page["has_more"] or not batch:
+                return rows
+            offset += len(batch)
+            self.logger.debug(
+                "排班 %s 第 %d 页取到 %d 条，继续翻页 offset=%d",
+                work_date, page_index, len(batch), offset,
+            )
+
+        self.logger.warning(
+            "排班 %s 翻页达到上限 %d 页，可能未取全（已取 %d 条）",
+            work_date, max_pages, len(rows),
+        )
+        return rows
+
+    # ------------------------------------------------------------------
     # 审批：同意 / 拒绝任务
     # ------------------------------------------------------------------
     def execute_process_instance(self, process_instance_id: str, task_id,

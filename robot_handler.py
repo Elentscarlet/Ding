@@ -35,6 +35,9 @@ from cashflow_report import (build_cashflow_workbook,
                              format_summary_markdown)
 from checkin_report import (build_result, build_workbook, export_row_groups,
                             format_summary_markdown as format_checkin_markdown)
+from schedule_report import (build_detail_rows, build_matrix, build_name_map,
+                             build_schedule_workbook, fetch_schedules,
+                             format_schedule_markdown, resolve_date_range)
 from vacation_report import (balance_range, build_balance,
                              build_balance_workbook, format_balance_markdown)
 
@@ -50,6 +53,8 @@ BALANCE_WORDS = ("余额", "额度", "balance")
 BALANCE_ALL_WORDS = ("全部", "全历史", "all")
 # 收支明细：出现这些词就走收支分支
 CASHFLOW_WORDS = ("收支", "收入支出", "流水", "cashflow")
+# 排班表：整公司导出，只按日期，不看地点
+SCHEDULE_WORDS = ("排班", "排班表", "班表", "schedule")
 
 HELP_TEXT = "  \n".join([
     "**外勤打卡记录查询**",
@@ -74,6 +79,9 @@ HELP_TEXT = "  \n".join([
     "**导出收支**：生成 Excel 私发给你（汇总 + 明细两个 sheet）",
     "**收支 全部**：回看最近 365 天（接口上限）",
     "",
+    "**排班 [日期] [日期]**：拉取钉钉排班表，生成 Excel 私发给你",
+    "例：排班 2026-11-01 2026-11-30（不写日期默认最近 7 天）",
+    "",
     "**帮助**：显示本说明",
 ])
 
@@ -81,6 +89,23 @@ HELP_TEXT = "  \n".join([
 # ======================================================================
 # 指令解析（纯函数，可单测）
 # ======================================================================
+_ACTION_PREFIXES = ("导出", "下载", "查询", "查看", "查")
+
+
+def _strip_action_prefix(token: str) -> str:
+    """去掉动作前缀，用来识别「导出排班」「查排班」这类连写。
+
+    本身就是一个动作词（如「查询」）时原样返回，避免被更短的前缀（「查」）误剪。
+    """
+    text = (token or "").strip()
+    if text in _ACTION_PREFIXES:
+        return text
+    for prefix in _ACTION_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
 def parse_command(text: str, place_names: Sequence[str] = (),
                   today: Optional[date] = None) -> dict:
     """把聊天文本解析成 {action, from, to, place, note}。
@@ -123,9 +148,17 @@ def parse_command(text: str, place_names: Sequence[str] = (),
             cashflow_mode = "summary"
 
     action = "query"
-    if head in EXPORT_WORDS:
+    if _strip_action_prefix(head) in SCHEDULE_WORDS:
+        # 「排班」「排班表」「导出排班」「查排班」都走排班
+        action = "schedule"
+        tokens = tokens[1:]
+    elif head in EXPORT_WORDS:
         action = "export"
         tokens = tokens[1:]
+        # 「导出 排班 …」这种带空格的写法
+        if tokens and tokens[0] in SCHEDULE_WORDS:
+            action = "schedule"
+            tokens = tokens[1:]
     elif head in QUERY_WORDS:
         tokens = tokens[1:]
 
@@ -158,7 +191,8 @@ def parse_command(text: str, place_names: Sequence[str] = (),
 
     place: Optional[str] = None
     note: Optional[str] = None
-    if others:
+    # 排班是整公司导出，不解析地点关键字
+    if action != "schedule" and others:
         keyword = " ".join(others)
         matched = match_place(keyword, place_names)
         if matched:
@@ -202,7 +236,7 @@ class CheckinRobotHandler(AsyncChatbotHandler):
     def __init__(self, cfg, api, checkin_store, user_store, tz: timezone,
                  places: Sequence, logger: logging.Logger,
                  departments=(), leave_code: str = "",
-                 hours_per_day: float = 6.0, cashflow=None):
+                 hours_per_day: float = 6.0, cashflow=None, schedule_cfg=None):
         """
         :param cfg: AppConfig.robot
         :param api: DingTalkApiClient
@@ -215,6 +249,7 @@ class CheckinRobotHandler(AsyncChatbotHandler):
         :param leave_code: 余额表统计的假期类型（默认奖励假期）
         :param hours_per_day: 一天折算多少小时，用于把额度换算成天
         :param cashflow: CashflowService（可为 None，此时「收支」相关指令不可用）
+        :param schedule_cfg: AppConfig.schedule（为 None 或未启用时「排班」指令不可用）
         """
         super().__init__(max_workers=4)
         self.cfg = cfg
@@ -231,6 +266,7 @@ class CheckinRobotHandler(AsyncChatbotHandler):
         self.leave_code = leave_code
         self.hours_per_day = hours_per_day
         self.cashflow = cashflow
+        self.schedule_cfg = schedule_cfg
 
     # ------------------------------------------------------------------
     # 入口（注意：AsyncChatbotHandler 要求 process 不是 async）
@@ -283,6 +319,8 @@ class CheckinRobotHandler(AsyncChatbotHandler):
             self.cashflow_detail(incoming, command)
         elif action == "cashflow_export":
             self.cashflow_export(incoming, command)
+        elif action == "schedule":
+            self.schedule(incoming, command)
         else:
             self.query(incoming, command)
 
@@ -576,6 +614,80 @@ class CheckinRobotHandler(AsyncChatbotHandler):
             f"（收入 {result['summary']['totals']['income_count']} / "
             f"支出 {result['summary']['totals']['expense_count']}）。  \n"
             "没收到的话，先在钉钉里和机器人单聊一次再试。",
+        )
+
+    # ------------------------------------------------------------------
+    # 排班表导出（钉钉排班 -> Excel，私发给提问的人）
+    # ------------------------------------------------------------------
+    def schedule(self, incoming: ChatbotMessage, command: dict):
+        cfg = self.schedule_cfg
+        if cfg is None or not getattr(cfg, "enabled", False):
+            self._reply(incoming, "排班", "排班导出未启用（config.yaml 的 schedule.enabled）。")
+            return
+
+        user_id = incoming.sender_staff_id
+        try:
+            from_date, to_date, days, note = resolve_date_range(
+                command.get("from"), command.get("to"), self.tz,
+                default_days=cfg.default_days, max_days=cfg.max_days,
+            )
+        except Exception as e:
+            self.logger.error("排班日期解析失败: %s", e, exc_info=True)
+            self._reply(incoming, "排班", f"日期解析失败：{e}")
+            return
+
+        self.logger.info(
+            "排班导出开始 | userId=%s | 范围=%s~%s（%d 天）",
+            user_id, from_date, to_date, len(days),
+        )
+
+        rows, failed_days = fetch_schedules(self.api, days, self.logger)
+        if not rows:
+            extra = f"（失败日期：{'、'.join(failed_days)}）" if failed_days else ""
+            self._reply(
+                incoming, "排班",
+                f"{from_date} ~ {to_date} 没有取到排班数据{extra}。  \n"
+                "请确认：接口权限（qyapi_base）、该日期是否超出排班范围"
+                "（固定班制只能查未来 15 天）。",
+            )
+            return
+
+        user_ids = sorted({str(r.get("userid") or "").strip()
+                           for r in rows if r.get("userid")})
+        names = build_name_map(self.user_store, user_ids, self.logger)
+        name_of = lambda uid: names.get(uid) or (uid or "-")    # noqa: E731
+
+        detail_rows = build_detail_rows(rows, name_of)
+        matrix = build_matrix(rows, days, name_of)
+        filename = f"{cfg.file_name_prefix}_{from_date}_{to_date}.xlsx"
+        payload = build_schedule_workbook(detail_rows, matrix, {
+            "range_text": f"{from_date} ~ {to_date}",
+            "day_count": len(days),
+            "exported_at": datetime.now(self.tz).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+        try:
+            self.api.send_file_to_user(
+                user_id, payload, filename,
+                file_type="xlsx", robot_code=self.cfg.robot_code,
+            )
+        except Exception as e:
+            self.logger.error("发送排班表失败 | userId=%s | %s", user_id, e, exc_info=True)
+            self._reply(
+                incoming, "排班导出失败",
+                f"表格已生成，但发送文件失败：{e}  \n"
+                "如果提示没有有效的单聊会话，请先在钉钉里打开机器人会话发一句话再重试。",
+            )
+            return
+
+        self.logger.info(
+            "排班表已发送 | userId=%s | 文件=%s | %d 人 | 明细=%d 条 | %d 字节",
+            user_id, filename, len(matrix["rows"]), len(detail_rows), len(payload),
+        )
+        self._reply(
+            incoming, "排班表已导出",
+            format_schedule_markdown(matrix, detail_rows, failed_days, note)
+            + f"  \n已把 **{filename}** 私发给你。",
         )
 
     # ------------------------------------------------------------------

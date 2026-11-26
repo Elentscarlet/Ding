@@ -113,7 +113,7 @@ def main():
             dingtalk_stream.ChatbotMessage.TOPIC,
             CheckinRobotHandler(
                 cfg.robot, api, checkin_store, user_store, tz,
-                cfg.checkin.places, logger,
+                cfg.checkin.places, logger, schedule_cfg=cfg.schedule,
                 departments=(cfg.checkin.department_ids,
                              cfg.checkin.include_sub_departments),
                 leave_code=cfg.robot.vacation_leave_code
