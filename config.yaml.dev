@@ -1,0 +1,79 @@
+dingtalk:
+  client_id: "dinglfmko5jfwd0pfiq4"
+  client_secret: "3Kev0-8LmJFIJYcRF9R7XaUZtPxQrAAZy-x3Z7fhxO_KIJXD7V_Qfi9r9artvtN8"
+
+# OA 审批配置
+approval:
+  # 奖励假期审批模板的 processCode（在钉钉审批模板详情页获取）
+  reward_leave_process_code: "PROC-7C18EF1A-F46C-4735-BD56-23E012C6FA98"
+  # 奖励假期对应的钉钉假期类型 leave_code（通过「查询假期规则列表」接口获取）
+  reward_leave_code: "7199f305-2985-4c85-9ed5-233665faaf45"
+  # 拥有 OA 审批应用权限的管理员 userId（调用审批详情 API 需要）
+  admin_user_id: "063409665921838379"
+
+logging:
+  level: "INFO"
+  file: "logs/event_subscriber.log"
+
+connection:
+  max_consecutive_failures: 5
+  reconnect_backoff: [2, 5, 10, 30, 60]
+
+# 外勤打卡轮询配置
+checkin:
+  enabled: true               # 关掉则完全不启动轮询任务
+  poll_interval: 6000          # 轮询间隔（秒），不建议小于 30
+  lookback_days: 1            # 每次回看天数，接口上限 7 天（重叠部分靠去重兜底）
+  utc_offset_hours: 8         # 时段判定所用时区，东八区填 8
+  user_cache_ttl: 1800        # 部门员工列表缓存时长（秒）
+  include_sub_departments: true   # 是否递归包含子部门（需要「通讯录部门信息读权限」）
+  department_ids: [1]         # 要轮询的部门 deptId，根部门传 1
+
+  # 判定口径
+  require_outside: true           # 仅记录外勤打卡（locationResult=Outside）
+  exclude_invalid_records: false  # 是否排除需二次确认等异常打卡
+
+  # 外勤地点规则：坐标 + 半径（米） + 生效时段；命中任意一条即记录一条
+  # 时段支持跨夜写法，例如 "22:00-06:00"
+  places:
+    - name: "新桥派出所"
+      longitude: 121.308527
+      latitude: 31.05267
+      radius: 800
+      time_range: "09:00-12:00"
+    - name: "百鸟幼儿园道悦部（上午）"
+      longitude: 121.259677
+      latitude: 31.101174
+      radius: 1500
+      time_range: "7:50-8:30"
+    - name: "百鸟幼儿园道悦部（下午）"
+      longitude: 121.259677
+      latitude: 31.101174
+      radius: 1500
+      time_range: "15:55-16:05"
+
+  # MongoDB：连接串也可用环境变量 MONGODB_URI 覆盖
+  mongo:
+    uri: "mongodb://127.0.0.1:27017"
+    database: "dingtalk"
+    collection: "checkin_records"
+    users_collection: "users"      # 员工姓名缓存（机器人展示"到岗人"用）
+    server_selection_timeout_ms: 3000
+
+# 外勤打卡查询机器人
+# 用法：在钉钉里直接和机器人单聊，或在群里 @机器人，例如
+#   查询 2026-10-13
+#   查询 2026-10-13 2026-10-14 新桥派出所
+#   导出 昨天
+#   地点 / 帮助
+robot:
+  enabled: true
+  # 允许使用机器人的白名单 userId（不在名单里的人，机器人一律不响应）
+  admin_user_ids:
+    - "063409665921838379"
+  # 机器人 robotCode；留空则用 dingtalk.client_id（企业内部应用机器人通常就是它）
+  robot_code: ""
+  default_range_days: 7        # 不写日期时默认查最近几天
+  max_summary_rows: 30         # 聊天里最多展示多少条（地点/日期），超出会提示用导出
+  export_limit: 20000          # 单次导出上限行数
+  file_name_prefix: "外勤打卡记录"
